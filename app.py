@@ -1,5 +1,7 @@
 import datetime as dt
+import json
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -135,44 +137,55 @@ def compute_regime_indicators(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
     return out
 
 
-def classify_downtrend(df: pd.DataFrame, settings: dict) -> tuple[pd.Series, dict[str, pd.Series]]:
+def classify_downtrend(df: pd.DataFrame, settings: dict) -> tuple[pd.Series, dict[str, pd.Series], pd.Series]:
     label = pd.Series("none", index=df.index)
 
     atr_fast_short = df["ATR_PCT_FAST"].rolling(3).max()
     atr_fast_long = df["ATR_PCT_FAST"].shift(4).rolling(78).max()
+    atr_fast_roll2 = df["ATR_PCT_FAST"].rolling(2).mean()
+    atr_fast_shift2_roll2 = df["ATR_PCT_FAST"].shift(2).rolling(2).mean()
+    atr_fast_shift1_roll5 = df["ATR_PCT_FAST"].shift(1).rolling(5).mean()
+    vol_fast_shift6_roll15 = df["Volume_MA_FAST"].shift(6).rolling(15).max()
+    vol_fast_shift1_roll5 = df["Volume_MA_FAST"].shift(1).rolling(5).max()
+    adx_roll2 = df["ADX"].rolling(2).mean()
     atr_slow_short = df["ATR_PCT"].rolling(5).mean()
     atr_slow_long = df["ATR_PCT"].shift(6).rolling(5).mean()
+    vol_slow_shift6 = df["Volume_MA"].shift(6)
+    atr_pct_shift4 = df["ATR_PCT"].shift(4)
+    atr_pct_shift12 = df["ATR_PCT"].shift(12)
+    atr_pct_shift24 = df["ATR_PCT"].shift(24)
+    atr_pct_shift30 = df["ATR_PCT"].shift(30)
 
-    fast_down_trend = (
+    fast_down_trend_raw = (
         ((df["MA_FAST"] < df["MA_FAST"].shift(1))
         #& (df["ADX"].rolling(2).mean() > settings["trend_adx_threshold"])
         & (atr_fast_short > atr_fast_long)
-        & (df["Volume_MA_FAST"] > df["Volume_MA_FAST"].shift(6).rolling(15).max())
+        & (df["Volume_MA_FAST"] > vol_fast_shift6_roll15)
         & (df["MA_FAST"] < df["MA_SLOW"]))
         | ((df["Close"] < df["MA_SLOW"]) & (df["Close"].shift(1) < df["MA_SLOW"])
-        & (df["ATR_PCT_FAST"] > df["ATR_PCT_FAST"].shift(1).rolling(5).mean())
-        & (df["Volume_MA_FAST"] > 1.1* df["Volume_MA_FAST"].shift(1).rolling(5).max())
-        & (df["ADX"].rolling(2).mean() > settings["trend_adx_threshold"])
+        & (df["ATR_PCT_FAST"] > atr_fast_shift1_roll5)
+        & (df["Volume_MA_FAST"] > 1.1 * vol_fast_shift1_roll5)
+        & (adx_roll2 > settings["trend_adx_threshold"])
         & (df["RSI_FAST"] > 30)
         )
     )
 
-    slow_down_trend = (
+    slow_down_trend_raw = (
         (df["MA_SLOW"] < df["MA_SLOW"].shift(1))
         & (df["ADX"] > settings["trend_adx_threshold"])
         & (atr_slow_short > atr_slow_long)
-        & (df["Volume_MA"] > df["Volume_MA"].shift(6))
-        & (df["ATR_PCT"] > df["ATR_PCT"].shift(4))
-        & (df["ATR_PCT"].shift(4) > df["ATR_PCT"].shift(12))
-        & (df["ATR_PCT"].shift(12) > df["ATR_PCT"].shift(24))
-        & (df["ATR_PCT"].shift(24) > df["ATR_PCT"].shift(30))
+        & (df["Volume_MA"] > vol_slow_shift6)
+        & (df["ATR_PCT"] > atr_pct_shift4)
+        & (atr_pct_shift4 > atr_pct_shift12)
+        & (atr_pct_shift12 > atr_pct_shift24)
+        & (atr_pct_shift24 > atr_pct_shift30)
     )
 
     freeze_uptrend = pd.Series(False, index=df.index)
     freeze_active = False
     ma_slow_up = df["MA_SLOW"] > df["MA_SLOW"].shift(1)
     for idx in df.index:
-        if slow_down_trend.loc[idx]:
+        if slow_down_trend_raw.loc[idx]:
             freeze_active = True
         if freeze_active and ma_slow_up.loc[idx]:
             freeze_active = False
@@ -181,7 +194,7 @@ def classify_downtrend(df: pd.DataFrame, settings: dict) -> tuple[pd.Series, dic
     fast_up_trend = (
         (df["MA_FAST"] > df["MA_FAST"].shift(1))
         #& (df["ADX_FAST"] > settings["trend_adx_threshold"])
-        & (df["ATR_PCT_FAST"].rolling(2).mean() < df["ATR_PCT_FAST"].shift(2).rolling(2).mean())
+        & (atr_fast_roll2 < atr_fast_shift2_roll2)
         & ~freeze_uptrend
     )
 
@@ -198,6 +211,48 @@ def classify_downtrend(df: pd.DataFrame, settings: dict) -> tuple[pd.Series, dic
         & (df["Volume"] > settings["panic_volume_mult"] * df["Volume_MA"])
     )
 
+    required_series = [
+        df["MA_FAST"],
+        df["MA_FAST"].shift(1),
+        df["MA_SLOW"],
+        df["MA_SLOW"].shift(1),
+        atr_fast_short,
+        atr_fast_long,
+        atr_fast_roll2,
+        atr_fast_shift2_roll2,
+        atr_fast_shift1_roll5,
+        vol_fast_shift6_roll15,
+        vol_fast_shift1_roll5,
+        adx_roll2,
+        atr_slow_short,
+        atr_slow_long,
+        vol_slow_shift6,
+        atr_pct_shift4,
+        atr_pct_shift12,
+        atr_pct_shift24,
+        atr_pct_shift30,
+        df["ADX"],
+        df["RSI"],
+        df["RSI_FAST"],
+        df["Ret_n"],
+        df["Volume"],
+        df["Volume_MA"],
+    ]
+    valid_mask = pd.concat(required_series, axis=1).notna().all(axis=1)
+
+    freeze_downtrend = pd.Series(False, index=df.index)
+    if settings.get("freeze_down_on_panic", False):
+        freeze_active = False
+        for idx in df.index:
+            if panic.loc[idx]:
+                freeze_active = True
+            if freeze_active and (fast_up_trend.loc[idx] or slow_up_trend.loc[idx]):
+                freeze_active = False
+            freeze_downtrend.loc[idx] = freeze_active
+
+    fast_down_trend = fast_down_trend_raw & ~freeze_downtrend
+    slow_down_trend = slow_down_trend_raw & ~freeze_downtrend
+
     rules = {
         "fast_down_trend": fast_down_trend,
         "slow_down_trend": slow_down_trend,
@@ -211,7 +266,7 @@ def classify_downtrend(df: pd.DataFrame, settings: dict) -> tuple[pd.Series, dic
         if condition is not None:
             label.loc[condition] = name
 
-    return label, rules
+    return label, rules, valid_mask
 
 
 def sharpe_ratio(returns: pd.Series, periods_per_year: int = 52, risk_free: float = 0.0) -> float:
@@ -310,12 +365,61 @@ def parse_priority_order(raw: str, options: list[str]) -> list[str]:
     return ordered
 
 
+def load_presets(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {name: values for name, values in data.items() if isinstance(values, dict)}
+
+
+def save_presets(path: Path, presets: dict) -> None:
+    path.write_text(json.dumps(presets, indent=2, sort_keys=True))
+
+
 st.title("Weekly Market Regime Dashboard")
 st.caption("Label weekly downtrend regimes and compare performance by regime.")
 st.caption("Lookbacks are in weeks and can be edited in the sidebar.")
 
 today = dt.date.today()
 default_start = today - dt.timedelta(days=365 * 10)
+presets_path = Path("regime_presets.json")
+presets = load_presets(presets_path)
+preset_keys = [
+    "ma_fast_len",
+    "ma_slow_len",
+    "rsi_len",
+    "rsi_fast_len",
+    "adx_len",
+    "adx_fast_len",
+    "atr_len",
+    "atr_fast_len",
+    "vol_len",
+    "vol_fast_len",
+    "return_window",
+    "volume_ma_len",
+    "volume_ma_fast_len",
+    "trend_adx_threshold",
+    "panic_rsi_max",
+    "panic_return_max",
+    "panic_volume_mult",
+    "freeze_down_on_panic",
+    "priority_raw",
+]
+if "pending_preset" in st.session_state:
+    pending_name = st.session_state.pop("pending_preset")
+    pending = presets.get(pending_name)
+    if pending:
+        for key in preset_keys:
+            if key in pending:
+                st.session_state[key] = pending[key]
+        st.session_state["preset_notice"] = f"Loaded preset: {pending_name}"
+    else:
+        st.session_state["preset_warning"] = "Preset not found."
 regime_options = [
     "fast_up_trend",
     "slow_up_trend",
@@ -326,53 +430,116 @@ regime_options = [
 
 with st.sidebar:
     st.header("Parameters")
-    ticker = st.text_input("Benchmark ticker", value="SPY")
-    start_date = st.date_input("Start date", value=default_start)
+    ticker = st.text_input("Benchmark ticker", value="SPY", key="ticker")
+    start_date = st.date_input("Start date", value=default_start, key="start_date")
     end_date = st.date_input(
         "End date",
         value=today,
         min_value=dt.date(2000, 1, 1),
         max_value=dt.date(2040, 12, 31),
+        key="end_date",
     )
-    show_markers = st.checkbox("Show regime markers", value=True)
+    show_markers = st.checkbox("Show regime markers", value=True, key="show_markers")
     st.subheader("Regime settings")
-    ma_fast_len = st.number_input("MA fast length (weeks)", min_value=2, max_value=300, value=50, step=1)
-    ma_slow_len = st.number_input("MA slow length (weeks)", min_value=10, max_value=400, value=200, step=1)
-    rsi_len = st.number_input("RSI slow length (weeks)", min_value=2, max_value=100, value=14, step=1)
-    rsi_fast_len = st.number_input("RSI fast length (weeks)", min_value=2, max_value=100, value=7, step=1)
-    adx_len = st.number_input("ADX slow length (weeks)", min_value=2, max_value=100, value=14, step=1)
-    adx_fast_len = st.number_input("ADX fast length (weeks)", min_value=2, max_value=100, value=7, step=1)
-    atr_len = st.number_input("ATR slow length (weeks)", min_value=2, max_value=100, value=14, step=1)
-    atr_fast_len = st.number_input("ATR fast length (weeks)", min_value=2, max_value=100, value=7, step=1)
-    vol_len = st.number_input("Volatility slow length (weeks)", min_value=2, max_value=104, value=20, step=1)
-    vol_fast_len = st.number_input("Volatility fast length (weeks)", min_value=2, max_value=104, value=10, step=1)
-    return_window = st.number_input("Panic return window (weeks)", min_value=2, max_value=52, value=5, step=1)
-    volume_ma_len = st.number_input("Volume MA slow length (weeks)", min_value=2, max_value=60, value=20, step=1)
-    volume_ma_fast_len = st.number_input(
+    ma_cols = st.columns(2)
+    ma_fast_len = ma_cols[0].number_input(
+        "MA fast length (weeks)", min_value=2, max_value=300, value=50, step=1, key="ma_fast_len"
+    )
+    ma_slow_len = ma_cols[1].number_input(
+        "MA slow length (weeks)", min_value=10, max_value=400, value=200, step=1, key="ma_slow_len"
+    )
+    rsi_cols = st.columns(2)
+    rsi_len = rsi_cols[0].number_input(
+        "RSI slow length (weeks)", min_value=2, max_value=100, value=14, step=1, key="rsi_len"
+    )
+    rsi_fast_len = rsi_cols[1].number_input(
+        "RSI fast length (weeks)", min_value=2, max_value=100, value=7, step=1, key="rsi_fast_len"
+    )
+    adx_cols = st.columns(2)
+    adx_len = adx_cols[0].number_input(
+        "ADX slow length (weeks)", min_value=2, max_value=100, value=14, step=1, key="adx_len"
+    )
+    adx_fast_len = adx_cols[1].number_input(
+        "ADX fast length (weeks)", min_value=2, max_value=100, value=7, step=1, key="adx_fast_len"
+    )
+    atr_cols = st.columns(2)
+    atr_len = atr_cols[0].number_input(
+        "ATR slow length (weeks)", min_value=2, max_value=100, value=14, step=1, key="atr_len"
+    )
+    atr_fast_len = atr_cols[1].number_input(
+        "ATR fast length (weeks)", min_value=2, max_value=100, value=7, step=1, key="atr_fast_len"
+    )
+    vol_cols = st.columns(2)
+    vol_len = vol_cols[0].number_input(
+        "Volatility slow length (weeks)", min_value=2, max_value=104, value=20, step=1, key="vol_len"
+    )
+    vol_fast_len = vol_cols[1].number_input(
+        "Volatility fast length (weeks)", min_value=2, max_value=104, value=10, step=1, key="vol_fast_len"
+    )
+    return_window = st.number_input("Panic return window (weeks)", min_value=2, max_value=52, value=5, step=1, key="return_window")
+    volume_cols = st.columns(2)
+    volume_ma_len = volume_cols[0].number_input(
+        "Volume MA slow length (weeks)", min_value=2, max_value=60, value=20, step=1, key="volume_ma_len"
+    )
+    volume_ma_fast_len = volume_cols[1].number_input(
         "Volume MA fast length (weeks)",
         min_value=2,
         max_value=60,
         value=10,
         step=1,
+        key="volume_ma_fast_len",
     )
     trend_adx_threshold = st.number_input(
-        "Trend ADX threshold", min_value=1.0, max_value=100.0, value=40.0, step=1.0
+        "Trend ADX threshold", min_value=1.0, max_value=100.0, value=40.0, step=1.0, key="trend_adx_threshold"
     )
-    panic_rsi_max = st.number_input("Panic RSI max", min_value=0.0, max_value=50.0, value=25.0, step=1.0)
+    panic_rsi_max = st.number_input("Panic RSI max", min_value=0.0, max_value=50.0, value=25.0, step=1.0, key="panic_rsi_max")
     panic_return_max = st.number_input(
-        "Panic return max", min_value=-1.0, max_value=0.0, value=-0.10, step=0.01, format="%.2f"
+        "Panic return max", min_value=-1.0, max_value=0.0, value=-0.10, step=0.01, format="%.2f", key="panic_return_max"
     )
     panic_volume_mult = st.number_input(
-        "Panic volume multiple", min_value=1.0, max_value=10.0, value=2.0, step=0.1, format="%.1f"
+        "Panic volume multiple", min_value=1.0, max_value=10.0, value=2.0, step=0.1, format="%.1f", key="panic_volume_mult"
+    )
+    freeze_down_on_panic = st.checkbox(
+        "Freeze down-trend after panic until up-trend",
+        value=True,
+        key="freeze_down_on_panic",
     )
     priority_raw = st.text_input(
         "Regime priority order (comma or space separated)",
         value=", ".join(regime_options),
         help="Only listed regimes are active; later rules override earlier ones; 'none' is implied.",
+        key="priority_raw",
     )
     st.caption(f"Available regimes: {', '.join(regime_options)}")
+    st.subheader("Presets")
+    preset_name = st.text_input("Preset name", value="", key="preset_name")
+    save_preset = st.button("Save preset", key="save_preset")
+    preset_options = ["(select)"] + sorted(presets.keys())
+    preset_to_load = st.selectbox("Load preset", options=preset_options, key="preset_to_load")
+    load_preset = st.button("Load preset", key="load_preset")
 
 priority_order = parse_priority_order(priority_raw, regime_options)
+if save_preset:
+    name = preset_name.strip()
+    if not name:
+        st.sidebar.warning("Preset name is required.")
+    else:
+        presets[name] = {key: st.session_state.get(key) for key in preset_keys}
+        save_presets(presets_path, presets)
+        st.session_state["preset_notice"] = f"Saved preset: {name}"
+        st.rerun()
+
+if load_preset:
+    if preset_to_load == "(select)":
+        st.sidebar.warning("Choose a preset to load.")
+    else:
+        st.session_state["pending_preset"] = preset_to_load
+        st.rerun()
+
+if "preset_warning" in st.session_state:
+    st.sidebar.warning(st.session_state.pop("preset_warning"))
+if "preset_notice" in st.session_state:
+    st.sidebar.success(st.session_state.pop("preset_notice"))
 
 settings = {
     "ma_fast_len": int(ma_fast_len),
@@ -392,6 +559,7 @@ settings = {
     "panic_rsi_max": float(panic_rsi_max),
     "panic_return_max": float(panic_return_max),
     "panic_volume_mult": float(panic_volume_mult),
+    "freeze_down_on_panic": bool(freeze_down_on_panic),
     "priority_order": priority_order,
 }
 
@@ -400,7 +568,23 @@ if start_date >= end_date:
     st.error("Start date must be before end date.")
     st.stop()
 
-raw = load_weekly_data(ticker, start_date, end_date)
+warmup_weeks = max(
+    settings["ma_slow_len"],
+    settings["ma_fast_len"],
+    settings["atr_len"],
+    settings["atr_fast_len"],
+    settings["adx_len"],
+    settings["adx_fast_len"],
+    settings["rsi_len"],
+    settings["rsi_fast_len"],
+    settings["vol_len"],
+    settings["vol_fast_len"],
+    settings["volume_ma_len"],
+    settings["volume_ma_fast_len"],
+    settings["return_window"],
+) + 120
+warmup_start = start_date - dt.timedelta(weeks=int(warmup_weeks))
+raw = load_weekly_data(ticker, warmup_start, end_date)
 if raw.empty:
     st.error("No data returned. Check the ticker or date range.")
     st.stop()
@@ -409,21 +593,32 @@ if settings["ma_fast_len"] >= settings["ma_slow_len"]:
     st.warning("MA fast length should be smaller than MA slow length.")
 
 data = compute_regime_indicators(raw, settings)
-regime_labels, regime_rules = classify_downtrend(data, settings)
+regime_labels, regime_rules, valid_mask = classify_downtrend(data, settings)
 data["Regime"] = regime_labels
+valid_index = valid_mask[valid_mask].index
+if valid_index.empty:
+    st.error("Not enough data to compute indicators with the current settings.")
+    st.stop()
+valid_start = valid_index[0]
+effective_start = max(pd.Timestamp(start_date), valid_start)
+if effective_start > pd.Timestamp(start_date):
+    st.info(f"Start date adjusted to {effective_start.date()} to allow indicator warm-up.")
+data = data.loc[data.index >= effective_start].copy()
 
 weekly_ret = data["Close"].pct_change()
 active_regimes = set(settings["priority_order"])
 buy_signal = pd.Series(False, index=data.index)
 sell_signal = pd.Series(False, index=data.index)
 if "fast_up_trend" in active_regimes:
-    buy_signal |= regime_rules["fast_up_trend"]
+    buy_signal |= regime_rules["fast_up_trend"].reindex(data.index, fill_value=False)
 if "slow_up_trend" in active_regimes:
-    buy_signal |= regime_rules["slow_up_trend"]
+    buy_signal |= regime_rules["slow_up_trend"].reindex(data.index, fill_value=False)
+if "panic" in active_regimes:
+    buy_signal |= regime_rules["panic"].reindex(data.index, fill_value=False)
 if "fast_down_trend" in active_regimes:
-    sell_signal |= regime_rules["fast_down_trend"]
+    sell_signal |= regime_rules["fast_down_trend"].reindex(data.index, fill_value=False)
 if "slow_down_trend" in active_regimes:
-    sell_signal |= regime_rules["slow_down_trend"]
+    sell_signal |= regime_rules["slow_down_trend"].reindex(data.index, fill_value=False)
 strategy_returns, _ = compute_trade_returns(weekly_ret, buy_signal, sell_signal, fee=0.003)
 overall = compute_equity_stats(weekly_ret)
 strategy_stats = compute_equity_stats(strategy_returns)
@@ -435,18 +630,36 @@ label_order = settings["priority_order"] + ["none"]
 summary = compute_regime_summary(weekly_ret, data["Regime"], label_order)
 priority_text = " -> ".join(settings["priority_order"]) or "none"
 
-latest = data.tail(1).copy()
-st.subheader("Latest snapshot")
-snapshot = latest[["Close", "MA_FAST", "MA_SLOW", "RSI", "ADX", "Regime"]].copy()
-snapshot = snapshot.rename(
-    columns={
-        "MA_FAST": f"MA{settings['ma_fast_len']}",
-        "MA_SLOW": f"MA{settings['ma_slow_len']}",
-        "RSI": f"RSI{settings['rsi_len']}",
-        "ADX": f"ADX{settings['adx_len']}",
-    }
-)
-st.dataframe(snapshot)
+st.subheader("Performance metrics")
+st.caption("Signal backtest uses fast/slow up-trend to enter and fast/slow down-trend to exit. Fees: 0.30% per side.")
+if overall or strategy_stats:
+    metrics = [
+        "Total Return",
+        "CAGR",
+        "Max Drawdown",
+        "Sharpe (ann.)",
+        "Volatility (ann.)",
+    ]
+    combined = pd.DataFrame({"Metric": metrics})
+    if overall:
+        combined["Buy & Hold"] = [
+            format_pct(overall["Total Return"]),
+            format_pct(overall["CAGR"]),
+            format_pct(overall["Max Drawdown"]),
+            format_num(overall["Sharpe"]),
+            format_pct(overall["Volatility"]),
+        ]
+    if strategy_stats:
+        combined["Signal Backtest"] = [
+            format_pct(strategy_stats["Total Return"]),
+            format_pct(strategy_stats["CAGR"]),
+            format_pct(strategy_stats["Max Drawdown"]),
+            format_num(strategy_stats["Sharpe"]),
+            format_pct(strategy_stats["Volatility"]),
+        ]
+    st.table(combined)
+else:
+    st.info("Not enough data to compute performance metrics.")
 
 st.subheader("Price and regimes")
 fig = make_subplots(
@@ -664,6 +877,7 @@ st.markdown(
                 f"Priority order (later rules override earlier ones): `{priority_text}`."
             ),
             "After `slow_down_trend`, up-trend regimes are suppressed until MA_slow > prior MA_slow.",
+            "Optional: if enabled, `panic` freezes down-trend regimes until an up-trend fires.",
             "",
             (
                 f"- `fast_down_trend`: MA{settings['ma_fast_len']} < prior MA{settings['ma_fast_len']} AND "
@@ -709,37 +923,6 @@ else:
     display["Sharpe"] = display["Sharpe"].apply(format_num)
     display["Volatility"] = display["Volatility"].apply(format_pct)
     st.table(display)
-
-st.subheader("Performance metrics")
-st.caption("Signal backtest uses fast/slow up-trend to enter and fast/slow down-trend to exit. Fees: 0.30% per side.")
-if overall or strategy_stats:
-    metrics = [
-        "Total Return",
-        "CAGR",
-        "Max Drawdown",
-        "Sharpe (ann.)",
-        "Volatility (ann.)",
-    ]
-    combined = pd.DataFrame({"Metric": metrics})
-    if overall:
-        combined["Buy & Hold"] = [
-            format_pct(overall["Total Return"]),
-            format_pct(overall["CAGR"]),
-            format_pct(overall["Max Drawdown"]),
-            format_num(overall["Sharpe"]),
-            format_pct(overall["Volatility"]),
-        ]
-    if strategy_stats:
-        combined["Signal Backtest"] = [
-            format_pct(strategy_stats["Total Return"]),
-            format_pct(strategy_stats["CAGR"]),
-            format_pct(strategy_stats["Max Drawdown"]),
-            format_num(strategy_stats["Sharpe"]),
-            format_pct(strategy_stats["Volatility"]),
-        ]
-    st.table(combined)
-else:
-    st.info("Not enough data to compute performance metrics.")
 
 st.subheader("Regime label sample")
 st.dataframe(data[["Close", "Regime"]].tail(12))

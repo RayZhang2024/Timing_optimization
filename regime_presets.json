@@ -1,0 +1,23 @@
+{
+  "optimal_setting_1": {
+    "adx_fast_len": 5,
+    "adx_len": 14,
+    "atr_fast_len": 4,
+    "atr_len": 14,
+    "freeze_down_on_panic": true,
+    "ma_fast_len": 6,
+    "ma_slow_len": 20,
+    "panic_return_max": -0.20000000000000007,
+    "panic_rsi_max": 25.0,
+    "panic_volume_mult": 1.3999999999999995,
+    "priority_raw": "fast_up_trend, slow_up_trend, slow_down_trend, fast_down_trend, panic",
+    "return_window": 7,
+    "rsi_fast_len": 7,
+    "rsi_len": 7,
+    "trend_adx_threshold": 33.0,
+    "vol_fast_len": 10,
+    "vol_len": 20,
+    "volume_ma_fast_len": 10,
+    "volume_ma_len": 14
+  }
+}
