@@ -1,5 +1,8 @@
 import datetime as dt
+import itertools
 import json
+import math
+import random
 import re
 from pathlib import Path
 
@@ -324,6 +327,37 @@ def compute_trade_returns(
     return strategy_returns, position
 
 
+def compute_strategy_cagr(
+    raw: pd.DataFrame, settings: dict, start_date: dt.date, fee: float = 0.003
+) -> float:
+    data = compute_regime_indicators(raw, settings)
+    _, rules, valid_mask = classify_downtrend(data, settings)
+    valid_index = valid_mask[valid_mask].index
+    if valid_index.empty:
+        return np.nan
+    effective_start = max(pd.Timestamp(start_date), valid_index[0])
+    data = data.loc[data.index >= effective_start].copy()
+    if data.empty:
+        return np.nan
+    weekly_ret = data["Close"].pct_change()
+    active_regimes = set(settings["priority_order"])
+    buy_signal = pd.Series(False, index=data.index)
+    sell_signal = pd.Series(False, index=data.index)
+    if "fast_up_trend" in active_regimes:
+        buy_signal |= rules["fast_up_trend"].reindex(data.index, fill_value=False)
+    if "slow_up_trend" in active_regimes:
+        buy_signal |= rules["slow_up_trend"].reindex(data.index, fill_value=False)
+    if "panic" in active_regimes:
+        buy_signal |= rules["panic"].reindex(data.index, fill_value=False)
+    if "fast_down_trend" in active_regimes:
+        sell_signal |= rules["fast_down_trend"].reindex(data.index, fill_value=False)
+    if "slow_down_trend" in active_regimes:
+        sell_signal |= rules["slow_down_trend"].reindex(data.index, fill_value=False)
+    strategy_returns, _ = compute_trade_returns(weekly_ret, buy_signal, sell_signal, fee=fee)
+    stats = compute_equity_stats(strategy_returns)
+    return stats.get("CAGR", np.nan)
+
+
 def compute_regime_summary(returns: pd.Series, labels: pd.Series, order: list[str]) -> pd.DataFrame:
     rows = []
     total_weeks = len(labels)
@@ -363,6 +397,64 @@ def parse_priority_order(raw: str, options: list[str]) -> list[str]:
             ordered.append(token)
             seen.add(token)
     return ordered
+
+
+def get_state_or_default(key: str, default):
+    return st.session_state.get(key, default)
+
+
+WARMUP_KEYS = [
+    "ma_fast_len",
+    "ma_slow_len",
+    "atr_len",
+    "atr_fast_len",
+    "adx_len",
+    "adx_fast_len",
+    "rsi_len",
+    "rsi_fast_len",
+    "vol_len",
+    "vol_fast_len",
+    "volume_ma_len",
+    "volume_ma_fast_len",
+    "return_window",
+]
+
+OPT_PARAM_SPECS = [
+    {"key": "ma_fast_len", "label": "MA fast", "type": "int", "min": 2, "max": 300, "step": 1},
+    {"key": "ma_slow_len", "label": "MA slow", "type": "int", "min": 10, "max": 400, "step": 1},
+    {"key": "rsi_len", "label": "RSI slow", "type": "int", "min": 2, "max": 100, "step": 1},
+    {"key": "rsi_fast_len", "label": "RSI fast", "type": "int", "min": 2, "max": 100, "step": 1},
+    {"key": "adx_len", "label": "ADX slow", "type": "int", "min": 2, "max": 100, "step": 1},
+    {"key": "adx_fast_len", "label": "ADX fast", "type": "int", "min": 2, "max": 100, "step": 1},
+    {"key": "atr_len", "label": "ATR slow", "type": "int", "min": 2, "max": 100, "step": 1},
+    {"key": "atr_fast_len", "label": "ATR fast", "type": "int", "min": 2, "max": 100, "step": 1},
+    {"key": "vol_len", "label": "Vol slow", "type": "int", "min": 2, "max": 104, "step": 1},
+    {"key": "vol_fast_len", "label": "Vol fast", "type": "int", "min": 2, "max": 104, "step": 1},
+    {"key": "return_window", "label": "Panic return window", "type": "int", "min": 2, "max": 52, "step": 1},
+    {"key": "volume_ma_len", "label": "Volume MA slow", "type": "int", "min": 2, "max": 60, "step": 1},
+    {"key": "volume_ma_fast_len", "label": "Volume MA fast", "type": "int", "min": 2, "max": 60, "step": 1},
+    {"key": "trend_adx_threshold", "label": "Trend ADX threshold", "type": "float", "min": 1.0, "max": 100.0, "step": 1.0},
+    {"key": "panic_rsi_max", "label": "Panic RSI max", "type": "float", "min": 0.0, "max": 50.0, "step": 1.0},
+    {"key": "panic_return_max", "label": "Panic return max", "type": "float", "min": -1.0, "max": 0.0, "step": 0.01},
+    {"key": "panic_volume_mult", "label": "Panic volume mult", "type": "float", "min": 1.0, "max": 10.0, "step": 0.1},
+]
+OPT_SPEC_MAP = {spec["key"]: spec for spec in OPT_PARAM_SPECS}
+
+
+def calc_warmup_weeks(values: dict) -> int:
+    base = max(values.get(key, 0) for key in WARMUP_KEYS)
+    return int(base + 120)
+
+
+def build_param_values(min_val: float, max_val: float, step: float, kind: str) -> list:
+    if step <= 0 or max_val < min_val:
+        return []
+    if kind == "int":
+        step_int = max(1, int(step))
+        return list(range(int(min_val), int(max_val) + 1, step_int))
+    count = int(round((max_val - min_val) / step))
+    values = [min_val + i * step for i in range(count + 1)]
+    return [float(f"{val:.6f}") for val in values if min_val - 1e-12 <= val <= max_val + 1e-12]
 
 
 def load_presets(path: Path) -> dict:
@@ -410,6 +502,7 @@ preset_keys = [
     "freeze_down_on_panic",
     "priority_raw",
 ]
+opt_param_keys = list(OPT_SPEC_MAP.keys())
 if "pending_preset" in st.session_state:
     pending_name = st.session_state.pop("pending_preset")
     pending = presets.get(pending_name)
@@ -420,6 +513,18 @@ if "pending_preset" in st.session_state:
         st.session_state["preset_notice"] = f"Loaded preset: {pending_name}"
     else:
         st.session_state["preset_warning"] = "Preset not found."
+if "pending_opt_params" in st.session_state:
+    pending = st.session_state.pop("pending_opt_params")
+    for key in opt_param_keys:
+        if key in pending:
+            spec = OPT_SPEC_MAP.get(key)
+            value = pending[key]
+            if spec and spec["type"] == "int":
+                value = int(value)
+            elif spec:
+                value = float(value)
+            st.session_state[key] = value
+    st.session_state["opt_notice"] = "Applied optimized parameters."
 regime_options = [
     "fast_up_trend",
     "slow_up_trend",
@@ -430,83 +535,171 @@ regime_options = [
 
 with st.sidebar:
     st.header("Parameters")
-    ticker = st.text_input("Benchmark ticker", value="SPY", key="ticker")
-    start_date = st.date_input("Start date", value=default_start, key="start_date")
+    ticker = st.text_input("Benchmark ticker", value=get_state_or_default("ticker", "SPY"), key="ticker")
+    start_date = st.date_input(
+        "Start date", value=get_state_or_default("start_date", default_start), key="start_date"
+    )
     end_date = st.date_input(
         "End date",
-        value=today,
+        value=get_state_or_default("end_date", today),
         min_value=dt.date(2000, 1, 1),
         max_value=dt.date(2040, 12, 31),
         key="end_date",
     )
-    show_markers = st.checkbox("Show regime markers", value=True, key="show_markers")
+    show_markers = st.checkbox("Show regime markers", value=get_state_or_default("show_markers", True), key="show_markers")
     st.subheader("Regime settings")
     ma_cols = st.columns(2)
     ma_fast_len = ma_cols[0].number_input(
-        "MA fast length (weeks)", min_value=2, max_value=300, value=50, step=1, key="ma_fast_len"
+        "MA fast length (weeks)",
+        min_value=2,
+        max_value=300,
+        value=int(get_state_or_default("ma_fast_len", 50)),
+        step=1,
+        key="ma_fast_len",
     )
     ma_slow_len = ma_cols[1].number_input(
-        "MA slow length (weeks)", min_value=10, max_value=400, value=200, step=1, key="ma_slow_len"
+        "MA slow length (weeks)",
+        min_value=10,
+        max_value=400,
+        value=int(get_state_or_default("ma_slow_len", 200)),
+        step=1,
+        key="ma_slow_len",
     )
     rsi_cols = st.columns(2)
     rsi_len = rsi_cols[0].number_input(
-        "RSI slow length (weeks)", min_value=2, max_value=100, value=14, step=1, key="rsi_len"
+        "RSI slow length (weeks)",
+        min_value=2,
+        max_value=100,
+        value=int(get_state_or_default("rsi_len", 14)),
+        step=1,
+        key="rsi_len",
     )
     rsi_fast_len = rsi_cols[1].number_input(
-        "RSI fast length (weeks)", min_value=2, max_value=100, value=7, step=1, key="rsi_fast_len"
+        "RSI fast length (weeks)",
+        min_value=2,
+        max_value=100,
+        value=int(get_state_or_default("rsi_fast_len", 7)),
+        step=1,
+        key="rsi_fast_len",
     )
     adx_cols = st.columns(2)
     adx_len = adx_cols[0].number_input(
-        "ADX slow length (weeks)", min_value=2, max_value=100, value=14, step=1, key="adx_len"
+        "ADX slow length (weeks)",
+        min_value=2,
+        max_value=100,
+        value=int(get_state_or_default("adx_len", 14)),
+        step=1,
+        key="adx_len",
     )
     adx_fast_len = adx_cols[1].number_input(
-        "ADX fast length (weeks)", min_value=2, max_value=100, value=7, step=1, key="adx_fast_len"
+        "ADX fast length (weeks)",
+        min_value=2,
+        max_value=100,
+        value=int(get_state_or_default("adx_fast_len", 7)),
+        step=1,
+        key="adx_fast_len",
     )
     atr_cols = st.columns(2)
     atr_len = atr_cols[0].number_input(
-        "ATR slow length (weeks)", min_value=2, max_value=100, value=14, step=1, key="atr_len"
+        "ATR slow length (weeks)",
+        min_value=2,
+        max_value=100,
+        value=int(get_state_or_default("atr_len", 14)),
+        step=1,
+        key="atr_len",
     )
     atr_fast_len = atr_cols[1].number_input(
-        "ATR fast length (weeks)", min_value=2, max_value=100, value=7, step=1, key="atr_fast_len"
+        "ATR fast length (weeks)",
+        min_value=2,
+        max_value=100,
+        value=int(get_state_or_default("atr_fast_len", 7)),
+        step=1,
+        key="atr_fast_len",
     )
     vol_cols = st.columns(2)
     vol_len = vol_cols[0].number_input(
-        "Volatility slow length (weeks)", min_value=2, max_value=104, value=20, step=1, key="vol_len"
+        "Volatility slow length (weeks)",
+        min_value=2,
+        max_value=104,
+        value=int(get_state_or_default("vol_len", 20)),
+        step=1,
+        key="vol_len",
     )
     vol_fast_len = vol_cols[1].number_input(
-        "Volatility fast length (weeks)", min_value=2, max_value=104, value=10, step=1, key="vol_fast_len"
+        "Volatility fast length (weeks)",
+        min_value=2,
+        max_value=104,
+        value=int(get_state_or_default("vol_fast_len", 10)),
+        step=1,
+        key="vol_fast_len",
     )
-    return_window = st.number_input("Panic return window (weeks)", min_value=2, max_value=52, value=5, step=1, key="return_window")
+    return_window = st.number_input(
+        "Panic return window (weeks)",
+        min_value=2,
+        max_value=52,
+        value=int(get_state_or_default("return_window", 5)),
+        step=1,
+        key="return_window",
+    )
     volume_cols = st.columns(2)
     volume_ma_len = volume_cols[0].number_input(
-        "Volume MA slow length (weeks)", min_value=2, max_value=60, value=20, step=1, key="volume_ma_len"
+        "Volume MA slow length (weeks)",
+        min_value=2,
+        max_value=60,
+        value=int(get_state_or_default("volume_ma_len", 20)),
+        step=1,
+        key="volume_ma_len",
     )
     volume_ma_fast_len = volume_cols[1].number_input(
         "Volume MA fast length (weeks)",
         min_value=2,
         max_value=60,
-        value=10,
+        value=int(get_state_or_default("volume_ma_fast_len", 10)),
         step=1,
         key="volume_ma_fast_len",
     )
     trend_adx_threshold = st.number_input(
-        "Trend ADX threshold", min_value=1.0, max_value=100.0, value=40.0, step=1.0, key="trend_adx_threshold"
+        "Trend ADX threshold",
+        min_value=1.0,
+        max_value=100.0,
+        value=float(get_state_or_default("trend_adx_threshold", 40.0)),
+        step=1.0,
+        key="trend_adx_threshold",
     )
-    panic_rsi_max = st.number_input("Panic RSI max", min_value=0.0, max_value=50.0, value=25.0, step=1.0, key="panic_rsi_max")
+    panic_rsi_max = st.number_input(
+        "Panic RSI max",
+        min_value=0.0,
+        max_value=50.0,
+        value=float(get_state_or_default("panic_rsi_max", 25.0)),
+        step=1.0,
+        key="panic_rsi_max",
+    )
     panic_return_max = st.number_input(
-        "Panic return max", min_value=-1.0, max_value=0.0, value=-0.10, step=0.01, format="%.2f", key="panic_return_max"
+        "Panic return max",
+        min_value=-1.0,
+        max_value=0.0,
+        value=float(get_state_or_default("panic_return_max", -0.10)),
+        step=0.01,
+        format="%.2f",
+        key="panic_return_max",
     )
     panic_volume_mult = st.number_input(
-        "Panic volume multiple", min_value=1.0, max_value=10.0, value=2.0, step=0.1, format="%.1f", key="panic_volume_mult"
+        "Panic volume multiple",
+        min_value=1.0,
+        max_value=10.0,
+        value=float(get_state_or_default("panic_volume_mult", 2.0)),
+        step=0.1,
+        format="%.1f",
+        key="panic_volume_mult",
     )
     freeze_down_on_panic = st.checkbox(
         "Freeze down-trend after panic until up-trend",
-        value=True,
+        value=bool(get_state_or_default("freeze_down_on_panic", True)),
         key="freeze_down_on_panic",
     )
     priority_raw = st.text_input(
         "Regime priority order (comma or space separated)",
-        value=", ".join(regime_options),
+        value=get_state_or_default("priority_raw", ", ".join(regime_options)),
         help="Only listed regimes are active; later rules override earlier ones; 'none' is implied.",
         key="priority_raw",
     )
@@ -517,6 +710,7 @@ with st.sidebar:
     preset_options = ["(select)"] + sorted(presets.keys())
     preset_to_load = st.selectbox("Load preset", options=preset_options, key="preset_to_load")
     load_preset = st.button("Load preset", key="load_preset")
+    optimize_button = st.button("Optimize parameters", key="optimize_button")
 
 priority_order = parse_priority_order(priority_raw, regime_options)
 if save_preset:
@@ -540,6 +734,8 @@ if "preset_warning" in st.session_state:
     st.sidebar.warning(st.session_state.pop("preset_warning"))
 if "preset_notice" in st.session_state:
     st.sidebar.success(st.session_state.pop("preset_notice"))
+if "opt_notice" in st.session_state:
+    st.sidebar.success(st.session_state.pop("opt_notice"))
 
 settings = {
     "ma_fast_len": int(ma_fast_len),
@@ -568,21 +764,7 @@ if start_date >= end_date:
     st.error("Start date must be before end date.")
     st.stop()
 
-warmup_weeks = max(
-    settings["ma_slow_len"],
-    settings["ma_fast_len"],
-    settings["atr_len"],
-    settings["atr_fast_len"],
-    settings["adx_len"],
-    settings["adx_fast_len"],
-    settings["rsi_len"],
-    settings["rsi_fast_len"],
-    settings["vol_len"],
-    settings["vol_fast_len"],
-    settings["volume_ma_len"],
-    settings["volume_ma_fast_len"],
-    settings["return_window"],
-) + 120
+warmup_weeks = calc_warmup_weeks(settings)
 warmup_start = start_date - dt.timedelta(weeks=int(warmup_weeks))
 raw = load_weekly_data(ticker, warmup_start, end_date)
 if raw.empty:
@@ -591,6 +773,194 @@ if raw.empty:
 
 if settings["ma_fast_len"] >= settings["ma_slow_len"]:
     st.warning("MA fast length should be smaller than MA slow length.")
+
+
+@st.dialog("Parameter Optimization")
+def optimization_dialog() -> None:
+    st.write("Optimize in-sample CAGR using the current date range.")
+    st.caption(f"Date range: {start_date} to {end_date}")
+    search_mode = st.selectbox("Search method", ["Grid", "Random"], key="opt_search_mode")
+    max_trials = st.number_input("Max trials", min_value=1, max_value=5000, value=200, step=1, key="opt_max_trials")
+    seed = st.number_input("Random seed", min_value=0, max_value=100000, value=42, step=1, key="opt_seed")
+    range_pct = st.number_input(
+        "Range around current (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=20.0,
+        step=1.0,
+        key="opt_range_pct",
+    )
+
+    prev_range = st.session_state.get("opt_prev_range_pct")
+    if st.session_state.pop("opt_reset_ranges", False) or prev_range is None or not math.isclose(prev_range, range_pct):
+        pct = range_pct / 100.0
+        for spec in OPT_PARAM_SPECS:
+            key = spec["key"]
+            current = st.session_state.get(key, settings.get(key))
+            if spec["type"] == "int":
+                current_val = int(current)
+                min_val = max(spec["min"], math.floor(current_val * (1 - pct)))
+                max_val = min(spec["max"], math.ceil(current_val * (1 + pct)))
+                if min_val > max_val:
+                    min_val = max_val = current_val
+                st.session_state[f"opt_min_{key}"] = int(min_val)
+                st.session_state[f"opt_max_{key}"] = int(max_val)
+                st.session_state[f"opt_step_{key}"] = int(spec["step"])
+            else:
+                current_val = float(current)
+                delta = abs(current_val) * pct
+                min_val = max(spec["min"], current_val - delta)
+                max_val = min(spec["max"], current_val + delta)
+                if min_val > max_val:
+                    min_val = max_val = current_val
+                st.session_state[f"opt_min_{key}"] = float(min_val)
+                st.session_state[f"opt_max_{key}"] = float(max_val)
+                st.session_state[f"opt_step_{key}"] = float(spec["step"])
+        st.session_state["opt_prev_range_pct"] = range_pct
+
+    st.markdown("**Tune parameters**")
+    header = st.columns([2.4, 1, 1, 1])
+    header[0].markdown("Parameter")
+    header[1].markdown("Min")
+    header[2].markdown("Max")
+    header[3].markdown("Step")
+
+    param_inputs = {}
+    spec_map = OPT_SPEC_MAP
+    for spec in OPT_PARAM_SPECS:
+        key = spec["key"]
+        current = st.session_state.get(key, settings.get(key))
+        if spec["type"] == "int":
+            current_val = int(current)
+        else:
+            current_val = float(current)
+        current_val = min(max(current_val, spec["min"]), spec["max"])
+        row = st.columns([2.4, 1, 1, 1])
+        enabled = row[0].checkbox(spec["label"], value=False, key=f"opt_enable_{key}")
+        min_val = row[1].number_input(
+            "min",
+            min_value=spec["min"],
+            max_value=spec["max"],
+            value=current_val,
+            step=spec["step"],
+            key=f"opt_min_{key}",
+            label_visibility="collapsed",
+        )
+        max_val = row[2].number_input(
+            "max",
+            min_value=spec["min"],
+            max_value=spec["max"],
+            value=current_val,
+            step=spec["step"],
+            key=f"opt_max_{key}",
+            label_visibility="collapsed",
+        )
+        step_max = max(spec["step"], spec["max"] - spec["min"])
+        step_val = row[3].number_input(
+            "step",
+            min_value=spec["step"],
+            max_value=step_max,
+            value=spec["step"],
+            step=spec["step"],
+            key=f"opt_step_{key}",
+            label_visibility="collapsed",
+        )
+        param_inputs[key] = {"enabled": enabled, "min": min_val, "max": max_val, "step": step_val}
+
+    run_opt = st.button("Run optimization", key="run_optimization")
+    if not run_opt:
+        return
+
+    param_values = {}
+    for key, values in param_inputs.items():
+        if not values["enabled"]:
+            continue
+        spec = spec_map[key]
+        if values["max"] < values["min"]:
+            st.warning(f"{spec['label']}: max must be >= min.")
+            return
+        grid = build_param_values(values["min"], values["max"], values["step"], spec["type"])
+        if not grid:
+            st.warning(f"{spec['label']}: invalid range or step.")
+            return
+        param_values[key] = grid
+
+    if not param_values:
+        st.warning("Enable at least one parameter to tune.")
+        return
+
+    combinations = 1
+    for grid in param_values.values():
+        combinations *= len(grid)
+
+    warmup_values = {key: settings[key] for key in WARMUP_KEYS}
+    for key, grid in param_values.items():
+        if key in warmup_values:
+            warmup_values[key] = max(grid)
+    warmup_weeks = calc_warmup_weeks(warmup_values)
+    warmup_start = start_date - dt.timedelta(weeks=int(warmup_weeks))
+    raw_opt = raw
+    if raw_opt.empty or raw_opt.index.min() > pd.Timestamp(warmup_start):
+        raw_opt = load_weekly_data(ticker, warmup_start, end_date)
+    if raw_opt.empty:
+        st.error("No data returned for the optimization range.")
+        return
+
+    candidates = []
+    if search_mode == "Grid" and combinations <= max_trials:
+        keys = list(param_values.keys())
+        for combo in itertools.product(*(param_values[key] for key in keys)):
+            candidates.append(dict(zip(keys, combo)))
+    else:
+        if search_mode == "Grid":
+            st.info("Grid size exceeds max trials; using random sampling.")
+        rng = random.Random(seed)
+        keys = list(param_values.keys())
+        for _ in range(int(max_trials)):
+            candidates.append({key: rng.choice(param_values[key]) for key in keys})
+
+    total = len(candidates)
+    progress = st.progress(0.0) if total > 1 else None
+    results = []
+    for idx, candidate in enumerate(candidates, 1):
+        test_settings = settings.copy()
+        for key, value in candidate.items():
+            spec = spec_map[key]
+            test_settings[key] = int(value) if spec["type"] == "int" else float(value)
+        if test_settings["ma_fast_len"] >= test_settings["ma_slow_len"]:
+            continue
+        cagr = compute_strategy_cagr(raw_opt, test_settings, start_date)
+        if not np.isnan(cagr):
+            results.append({"CAGR": cagr, **candidate})
+        if progress and idx % 5 == 0:
+            progress.progress(idx / total)
+    if progress:
+        progress.empty()
+
+    if not results:
+        st.warning("No valid trials produced a CAGR.")
+        return
+
+    result_df = pd.DataFrame(results).sort_values("CAGR", ascending=False)
+    display = result_df.copy()
+    display["CAGR"] = display["CAGR"].apply(format_pct)
+    st.dataframe(display.head(20))
+
+    best_row = result_df.iloc[0]
+    best_params = {}
+    for key in param_values.keys():
+        spec = spec_map[key]
+        value = best_row[key]
+        best_params[key] = int(value) if spec["type"] == "int" else float(value)
+    st.write(f"Best CAGR: {format_pct(best_row['CAGR'])}")
+    if st.button("Apply best parameters", key="apply_best_params"):
+        st.session_state["pending_opt_params"] = best_params
+        st.rerun()
+
+
+if optimize_button:
+    st.session_state["opt_reset_ranges"] = True
+    optimization_dialog()
 
 data = compute_regime_indicators(raw, settings)
 regime_labels, regime_rules, valid_mask = classify_downtrend(data, settings)
