@@ -311,6 +311,17 @@ def compute_equity_stats(returns: pd.Series) -> dict:
     }
 
 
+def compute_partial_oos_stats(returns: pd.Series) -> dict:
+    clean = returns.dropna()
+    if len(clean) < 1:
+        return {"Total Return": np.nan, "CAGR": np.nan}
+    equity = (1 + clean).cumprod()
+    total_return = equity.iloc[-1] - 1
+    num_weeks = len(equity)
+    cagr = (equity.iloc[-1] ** (52 / num_weeks)) - 1 if num_weeks else np.nan
+    return {"Total Return": total_return, "CAGR": cagr}
+
+
 def compute_trade_returns(
     returns: pd.Series, buy_signal: pd.Series, sell_signal: pd.Series, fee: float
 ) -> tuple[pd.Series, pd.Series]:
@@ -327,18 +338,29 @@ def compute_trade_returns(
     return strategy_returns, position
 
 
-def compute_strategy_cagr(
-    raw: pd.DataFrame, settings: dict, start_date: dt.date, fee: float = 0.003
-) -> float:
+def compute_strategy_returns_window(
+    raw: pd.DataFrame,
+    settings: dict,
+    window_start: dt.date,
+    window_end: dt.date,
+    fee: float = 0.003,
+    end_exclusive: bool = False,
+) -> pd.Series:
+    if raw.empty:
+        return pd.Series(dtype=float)
     data = compute_regime_indicators(raw, settings)
     _, rules, valid_mask = classify_downtrend(data, settings)
     valid_index = valid_mask[valid_mask].index
     if valid_index.empty:
-        return np.nan
-    effective_start = max(pd.Timestamp(start_date), valid_index[0])
-    data = data.loc[data.index >= effective_start].copy()
+        return pd.Series(dtype=float)
+    effective_start = max(pd.Timestamp(window_start), valid_index[0])
+    window_end_ts = pd.Timestamp(window_end)
+    if end_exclusive:
+        data = data.loc[(data.index >= effective_start) & (data.index < window_end_ts)].copy()
+    else:
+        data = data.loc[(data.index >= effective_start) & (data.index <= window_end_ts)].copy()
     if data.empty:
-        return np.nan
+        return pd.Series(dtype=float)
     weekly_ret = data["Close"].pct_change()
     active_regimes = set(settings["priority_order"])
     buy_signal = pd.Series(False, index=data.index)
@@ -354,8 +376,71 @@ def compute_strategy_cagr(
     if "slow_down_trend" in active_regimes:
         sell_signal |= rules["slow_down_trend"].reindex(data.index, fill_value=False)
     strategy_returns, _ = compute_trade_returns(weekly_ret, buy_signal, sell_signal, fee=fee)
+    return strategy_returns
+
+
+def compute_strategy_cagr(
+    raw: pd.DataFrame, settings: dict, start_date: dt.date, fee: float = 0.003
+) -> float:
+    if raw.empty:
+        return np.nan
+    window_end = raw.index.max() + pd.Timedelta(days=1)
+    strategy_returns = compute_strategy_returns_window(
+        raw, settings, start_date, window_end, fee=fee, end_exclusive=True
+    )
     stats = compute_equity_stats(strategy_returns)
     return stats.get("CAGR", np.nan)
+
+
+def compute_strategy_cagr_window(
+    raw: pd.DataFrame,
+    settings: dict,
+    window_start: dt.date,
+    window_end: dt.date,
+    fee: float = 0.003,
+    end_exclusive: bool = True,
+) -> float:
+    strategy_returns = compute_strategy_returns_window(
+        raw, settings, window_start, window_end, fee=fee, end_exclusive=end_exclusive
+    )
+    stats = compute_equity_stats(strategy_returns)
+    return stats.get("CAGR", np.nan)
+
+
+def compute_strategy_objective_from_returns(returns: pd.Series) -> tuple[float, float, float]:
+    stats = compute_equity_stats(returns)
+    cagr = stats.get("CAGR", np.nan)
+    max_dd = stats.get("Max Drawdown", np.nan)
+    if np.isnan(cagr) or np.isnan(max_dd):
+        return np.nan, cagr, max_dd
+    objective = cagr + 0.1 * min(max_dd, -0.3)
+    return objective, cagr, max_dd
+
+
+def compute_strategy_objective(
+    raw: pd.DataFrame, settings: dict, start_date: dt.date, fee: float = 0.003
+) -> tuple[float, float, float]:
+    if raw.empty:
+        return np.nan, np.nan, np.nan
+    window_end = raw.index.max() + pd.Timedelta(days=1)
+    strategy_returns = compute_strategy_returns_window(
+        raw, settings, start_date, window_end, fee=fee, end_exclusive=True
+    )
+    return compute_strategy_objective_from_returns(strategy_returns)
+
+
+def compute_strategy_objective_window(
+    raw: pd.DataFrame,
+    settings: dict,
+    window_start: dt.date,
+    window_end: dt.date,
+    fee: float = 0.003,
+    end_exclusive: bool = True,
+) -> tuple[float, float, float]:
+    strategy_returns = compute_strategy_returns_window(
+        raw, settings, window_start, window_end, fee=fee, end_exclusive=end_exclusive
+    )
+    return compute_strategy_objective_from_returns(strategy_returns)
 
 
 def compute_regime_summary(returns: pd.Series, labels: pd.Series, order: list[str]) -> pd.DataFrame:
@@ -441,6 +526,55 @@ OPT_PARAM_SPECS = [
 OPT_SPEC_MAP = {spec["key"]: spec for spec in OPT_PARAM_SPECS}
 
 
+def _build_opt_dialog_state_keys() -> list[str]:
+    keys = [
+        "opt_search_mode",
+        "opt_max_trials",
+        "opt_seed",
+        "opt_range_pct",
+        "opt_prev_range_pct",
+        "wfo_ins_len",
+        "wfo_oos_len",
+        "wfo_mode",
+        "wfo_shifted",
+        "wfo_shift_step",
+    ]
+    for spec in OPT_PARAM_SPECS:
+        key = spec["key"]
+        keys.extend(
+            [
+                f"opt_enable_{key}",
+                f"opt_min_{key}",
+                f"opt_max_{key}",
+                f"opt_step_{key}",
+            ]
+        )
+    return keys
+
+
+OPT_DIALOG_STATE_KEYS = _build_opt_dialog_state_keys()
+
+
+def save_opt_dialog_state() -> None:
+    snapshot = dict(st.session_state.get("opt_dialog_state", {}))
+    updated = False
+    for key in OPT_DIALOG_STATE_KEYS:
+        if key in st.session_state:
+            snapshot[key] = st.session_state[key]
+            updated = True
+    if updated:
+        st.session_state["opt_dialog_state"] = snapshot
+
+
+def restore_opt_dialog_state() -> None:
+    snapshot = st.session_state.get("opt_dialog_state")
+    if not snapshot:
+        return
+    for key, value in snapshot.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
 def calc_warmup_weeks(values: dict) -> int:
     base = max(values.get(key, 0) for key in WARMUP_KEYS)
     return int(base + 120)
@@ -455,6 +589,70 @@ def build_param_values(min_val: float, max_val: float, step: float, kind: str) -
     count = int(round((max_val - min_val) / step))
     values = [min_val + i * step for i in range(count + 1)]
     return [float(f"{val:.6f}") for val in values if min_val - 1e-12 <= val <= max_val + 1e-12]
+
+
+def build_param_values_from_state(settings: dict) -> tuple[dict, bool]:
+    restore_opt_dialog_state()
+    snapshot = st.session_state.get("opt_dialog_state", {})
+    param_values = {}
+    invalid = False
+    range_pct = float(st.session_state.get("opt_range_pct", snapshot.get("opt_range_pct", 20.0))) / 100.0
+    for spec in OPT_PARAM_SPECS:
+        key = spec["key"]
+        default_enabled = key not in {"vol_len", "vol_fast_len"}
+        enabled = st.session_state.get(f"opt_enable_{key}", snapshot.get(f"opt_enable_{key}", default_enabled))
+        if not enabled:
+            continue
+        min_key = f"opt_min_{key}"
+        max_key = f"opt_max_{key}"
+        step_key = f"opt_step_{key}"
+        min_val = st.session_state.get(min_key, snapshot.get(min_key))
+        max_val = st.session_state.get(max_key, snapshot.get(max_key))
+        step_val = st.session_state.get(step_key, snapshot.get(step_key))
+        if min_val is None or max_val is None or step_val is None:
+            current = st.session_state.get(key, settings.get(key))
+            if spec["type"] == "int":
+                current_val = int(current)
+                min_val = max(spec["min"], math.floor(current_val * (1 - range_pct)))
+                max_val = min(spec["max"], math.ceil(current_val * (1 + range_pct)))
+                if min_val > max_val:
+                    min_val = max_val = current_val
+                step_val = int(spec["step"])
+            else:
+                current_val = float(current)
+                delta = abs(current_val) * range_pct
+                min_val = max(spec["min"], current_val - delta)
+                max_val = min(spec["max"], current_val + delta)
+                if min_val > max_val:
+                    min_val = max_val = current_val
+                step_val = float(spec["step"])
+            st.session_state[f"opt_min_{key}"] = min_val
+            st.session_state[f"opt_max_{key}"] = max_val
+            st.session_state[f"opt_step_{key}"] = step_val
+        if spec["type"] == "int":
+            min_val = int(min_val)
+            max_val = int(max_val)
+            step_val = int(step_val)
+        else:
+            min_val = float(min_val)
+            max_val = float(max_val)
+            step_val = float(step_val)
+        if max_val < min_val:
+            st.warning(f"{spec['label']}: max must be >= min.")
+            invalid = True
+            continue
+        grid = build_param_values(min_val, max_val, step_val, spec["type"])
+        if not grid:
+            st.warning(f"{spec['label']}: invalid range or step.")
+            invalid = True
+            continue
+        param_values[key] = grid
+
+    if not param_values:
+        st.warning("Enable at least one parameter to tune.")
+        invalid = True
+
+    return param_values, invalid
 
 
 def load_presets(path: Path) -> dict:
@@ -711,6 +909,17 @@ with st.sidebar:
     preset_to_load = st.selectbox("Load preset", options=preset_options, key="preset_to_load")
     load_preset = st.button("Load preset", key="load_preset")
     optimize_button = st.button("Optimize parameters", key="optimize_button")
+    if optimize_button:
+        restore_opt_dialog_state()
+        st.session_state["opt_dialog_open"] = True
+        if "opt_prev_range_pct" not in st.session_state:
+            st.session_state["opt_reset_ranges"] = True
+    run_optimization = st.button("Run optimization", key="run_optimization_sidebar")
+    run_wfo = st.button("Run walk-forward", key="run_wfo_sidebar")
+    if run_optimization:
+        st.session_state["run_optimization"] = True
+    if run_wfo:
+        st.session_state["run_wfo"] = True
 
 priority_order = parse_priority_order(priority_raw, regime_options)
 if save_preset:
@@ -777,7 +986,7 @@ if settings["ma_fast_len"] >= settings["ma_slow_len"]:
 
 @st.dialog("Parameter Optimization")
 def optimization_dialog() -> None:
-    st.write("Optimize in-sample CAGR using the current date range.")
+    st.write("Optimize in-sample objective: CAGR + 0.1 * min(Max Drawdown, -0.3).")
     st.caption(f"Date range: {start_date} to {end_date}")
     search_mode = st.selectbox("Search method", ["Grid", "Random"], key="opt_search_mode")
     max_trials = st.number_input("Max trials", min_value=1, max_value=5000, value=200, step=1, key="opt_max_trials")
@@ -825,8 +1034,6 @@ def optimization_dialog() -> None:
     header[2].markdown("Max")
     header[3].markdown("Step")
 
-    param_inputs = {}
-    spec_map = OPT_SPEC_MAP
     for spec in OPT_PARAM_SPECS:
         key = spec["key"]
         current = st.session_state.get(key, settings.get(key))
@@ -836,7 +1043,8 @@ def optimization_dialog() -> None:
             current_val = float(current)
         current_val = min(max(current_val, spec["min"]), spec["max"])
         row = st.columns([2.4, 1, 1, 1])
-        enabled = row[0].checkbox(spec["label"], value=False, key=f"opt_enable_{key}")
+        default_enabled = key not in {"vol_len", "vol_fast_len"}
+        enabled = row[0].checkbox(spec["label"], value=default_enabled, key=f"opt_enable_{key}")
         min_val = row[1].number_input(
             "min",
             min_value=spec["min"],
@@ -865,102 +1073,412 @@ def optimization_dialog() -> None:
             key=f"opt_step_{key}",
             label_visibility="collapsed",
         )
-        param_inputs[key] = {"enabled": enabled, "min": min_val, "max": max_val, "step": step_val}
+    st.caption("Use the sidebar buttons to run optimization and walk-forward.")
 
-    run_opt = st.button("Run optimization", key="run_optimization")
-    if not run_opt:
-        return
+    st.markdown("**Walk-forward optimization**")
+    wfo_ins_len = st.number_input(
+        "In-sample length (weeks)", min_value=26, max_value=520, value=156, step=1, key="wfo_ins_len"
+    )
+    wfo_oos_len = st.number_input(
+        "Out-of-sample length (weeks)", min_value=13, max_value=260, value=52, step=1, key="wfo_oos_len"
+    )
+    st.caption("Step size equals the out-of-sample length.")
+    wfo_mode = st.selectbox("In-sample window", ["Rolling", "Expanding"], key="wfo_mode")
+    shifted_wfo = st.checkbox("Shifted walk-forward", value=False, key="wfo_shifted")
+    shift_default = max(1, int(wfo_oos_len) // 4)
+    shift_step_weeks = st.number_input(
+        "Shift step (weeks)",
+        min_value=1,
+        max_value=int(wfo_oos_len),
+        value=shift_default,
+        step=1,
+        key="wfo_shift_step",
+        disabled=not shifted_wfo,
+    )
+    if shifted_wfo:
+        st.caption("Shifted walk-forward runs multiple offsets within the OOS window length.")
+    st.caption("Use the sidebar buttons to run walk-forward and view results in the main window.")
+    save_opt_dialog_state()
 
-    param_values = {}
-    for key, values in param_inputs.items():
-        if not values["enabled"]:
-            continue
-        spec = spec_map[key]
-        if values["max"] < values["min"]:
-            st.warning(f"{spec['label']}: max must be >= min.")
-            return
-        grid = build_param_values(values["min"], values["max"], values["step"], spec["type"])
-        if not grid:
-            st.warning(f"{spec['label']}: invalid range or step.")
-            return
-        param_values[key] = grid
-
-    if not param_values:
-        st.warning("Enable at least one parameter to tune.")
-        return
-
-    combinations = 1
-    for grid in param_values.values():
-        combinations *= len(grid)
-
-    warmup_values = {key: settings[key] for key in WARMUP_KEYS}
-    for key, grid in param_values.items():
-        if key in warmup_values:
-            warmup_values[key] = max(grid)
-    warmup_weeks = calc_warmup_weeks(warmup_values)
-    warmup_start = start_date - dt.timedelta(weeks=int(warmup_weeks))
-    raw_opt = raw
-    if raw_opt.empty or raw_opt.index.min() > pd.Timestamp(warmup_start):
-        raw_opt = load_weekly_data(ticker, warmup_start, end_date)
-    if raw_opt.empty:
-        st.error("No data returned for the optimization range.")
-        return
-
-    candidates = []
-    if search_mode == "Grid" and combinations <= max_trials:
-        keys = list(param_values.keys())
-        for combo in itertools.product(*(param_values[key] for key in keys)):
-            candidates.append(dict(zip(keys, combo)))
-    else:
-        if search_mode == "Grid":
-            st.info("Grid size exceeds max trials; using random sampling.")
-        rng = random.Random(seed)
-        keys = list(param_values.keys())
-        for _ in range(int(max_trials)):
-            candidates.append({key: rng.choice(param_values[key]) for key in keys})
-
-    total = len(candidates)
-    progress = st.progress(0.0) if total > 1 else None
-    results = []
-    for idx, candidate in enumerate(candidates, 1):
-        test_settings = settings.copy()
-        for key, value in candidate.items():
-            spec = spec_map[key]
-            test_settings[key] = int(value) if spec["type"] == "int" else float(value)
-        if test_settings["ma_fast_len"] >= test_settings["ma_slow_len"]:
-            continue
-        cagr = compute_strategy_cagr(raw_opt, test_settings, start_date)
-        if not np.isnan(cagr):
-            results.append({"CAGR": cagr, **candidate})
-        if progress and idx % 5 == 0:
-            progress.progress(idx / total)
-    if progress:
-        progress.empty()
-
-    if not results:
-        st.warning("No valid trials produced a CAGR.")
-        return
-
-    result_df = pd.DataFrame(results).sort_values("CAGR", ascending=False)
-    display = result_df.copy()
-    display["CAGR"] = display["CAGR"].apply(format_pct)
-    st.dataframe(display.head(20))
-
-    best_row = result_df.iloc[0]
-    best_params = {}
-    for key in param_values.keys():
-        spec = spec_map[key]
-        value = best_row[key]
-        best_params[key] = int(value) if spec["type"] == "int" else float(value)
-    st.write(f"Best CAGR: {format_pct(best_row['CAGR'])}")
-    if st.button("Apply best parameters", key="apply_best_params"):
-        st.session_state["pending_opt_params"] = best_params
+    if st.button("Close", key="close_opt_dialog"):
+        save_opt_dialog_state()
+        st.session_state["opt_dialog_open"] = False
         st.rerun()
 
 
-if optimize_button:
-    st.session_state["opt_reset_ranges"] = True
+if st.session_state.get("opt_dialog_open"):
+    restore_opt_dialog_state()
     optimization_dialog()
+
+st.subheader("Optimization results")
+opt_progress_slot = st.empty()
+run_optimization = st.session_state.pop("run_optimization", False)
+if run_optimization:
+    param_values, invalid = build_param_values_from_state(settings)
+    if not invalid:
+        search_mode = st.session_state.get("opt_search_mode", "Grid")
+        max_trials = int(st.session_state.get("opt_max_trials", 200))
+        seed = int(st.session_state.get("opt_seed", 42))
+        save_opt_dialog_state()
+        combinations = 1
+        for grid in param_values.values():
+            combinations *= len(grid)
+
+        warmup_values = {key: settings[key] for key in WARMUP_KEYS}
+        for key, grid in param_values.items():
+            if key in warmup_values:
+                warmup_values[key] = max(grid)
+        warmup_weeks = calc_warmup_weeks(warmup_values)
+        warmup_start = start_date - dt.timedelta(weeks=int(warmup_weeks))
+        raw_opt = raw
+        if raw_opt.empty or raw_opt.index.min() > pd.Timestamp(warmup_start):
+            raw_opt = load_weekly_data(ticker, warmup_start, end_date)
+        if raw_opt.empty:
+            st.error("No data returned for the optimization range.")
+        else:
+            spec_map = OPT_SPEC_MAP
+            candidates = []
+            if search_mode == "Grid" and combinations <= max_trials:
+                keys = list(param_values.keys())
+                for combo in itertools.product(*(param_values[key] for key in keys)):
+                    candidates.append(dict(zip(keys, combo)))
+            else:
+                if search_mode == "Grid":
+                    st.info("Grid size exceeds max trials; using random sampling.")
+                rng = random.Random(seed)
+                keys = list(param_values.keys())
+                for _ in range(int(max_trials)):
+                    candidates.append({key: rng.choice(param_values[key]) for key in keys})
+
+            total = len(candidates)
+            progress = opt_progress_slot.progress(0.0) if total > 1 else None
+            results = []
+            for idx, candidate in enumerate(candidates, 1):
+                test_settings = settings.copy()
+                for key, value in candidate.items():
+                    spec = spec_map[key]
+                    test_settings[key] = int(value) if spec["type"] == "int" else float(value)
+                if test_settings["ma_fast_len"] >= test_settings["ma_slow_len"]:
+                    continue
+                objective, cagr, max_dd = compute_strategy_objective(raw_opt, test_settings, start_date)
+                if not np.isnan(objective):
+                    results.append({"Objective": objective, "CAGR": cagr, "Max Drawdown": max_dd, **candidate})
+                if progress and idx % 5 == 0:
+                    progress.progress(idx / total)
+            if progress:
+                progress.empty()
+
+            if results:
+                result_df = pd.DataFrame(results).sort_values("Objective", ascending=False)
+                best_row = result_df.iloc[0]
+                best_params = {}
+                for key in param_values.keys():
+                    spec = spec_map[key]
+                    value = best_row[key]
+                    best_params[key] = int(value) if spec["type"] == "int" else float(value)
+                st.session_state["opt_results"] = results
+                st.session_state["opt_best_params"] = best_params
+                st.session_state["opt_best_objective"] = float(best_row["Objective"])
+                st.session_state["opt_best_cagr"] = float(best_row["CAGR"])
+                st.session_state["opt_best_max_dd"] = float(best_row["Max Drawdown"])
+            else:
+                st.warning("No valid trials produced an objective score.")
+
+results = st.session_state.get("opt_results")
+if results:
+    result_df = pd.DataFrame(results)
+    if "Objective" not in result_df.columns:
+        st.warning("Optimization results are from an older run. Please rerun to compute the new objective.")
+        st.session_state.pop("opt_results", None)
+        st.session_state.pop("opt_best_params", None)
+        st.session_state.pop("opt_best_objective", None)
+        st.session_state.pop("opt_best_cagr", None)
+        st.session_state.pop("opt_best_max_dd", None)
+        st.rerun()
+    result_df = result_df.sort_values("Objective", ascending=False)
+    display = result_df.copy()
+    display["Objective"] = display["Objective"].apply(format_pct)
+    display["CAGR"] = display["CAGR"].apply(format_pct)
+    display["Max Drawdown"] = display["Max Drawdown"].apply(format_pct)
+    st.dataframe(display.head(20))
+
+    best_params = st.session_state.get("opt_best_params")
+    best_objective = st.session_state.get("opt_best_objective")
+    best_cagr = st.session_state.get("opt_best_cagr")
+    best_max_dd = st.session_state.get("opt_best_max_dd")
+    if best_params is None:
+        best_row = result_df.iloc[0]
+        best_params = {}
+        for key in result_df.columns:
+            if key in {"Objective", "CAGR", "Max Drawdown"}:
+                continue
+            spec = OPT_SPEC_MAP.get(key)
+            if not spec:
+                continue
+            value = best_row[key]
+            best_params[key] = int(value) if spec["type"] == "int" else float(value)
+    if best_objective is None:
+        best_objective = float(result_df.iloc[0]["Objective"])
+    if best_cagr is None:
+        best_cagr = float(result_df.iloc[0]["CAGR"])
+    if best_max_dd is None:
+        best_max_dd = float(result_df.iloc[0]["Max Drawdown"])
+    st.write(
+        "Best objective: "
+        f"{format_pct(best_objective)} "
+        f"(CAGR: {format_pct(best_cagr)}, Max DD: {format_pct(best_max_dd)})"
+    )
+    if st.button("Apply best parameters", key="apply_best_params"):
+        st.session_state["pending_opt_params"] = best_params
+        st.session_state["opt_dialog_open"] = False
+        st.rerun()
+    if st.button("Clear optimization results", key="clear_opt_results"):
+        st.session_state.pop("opt_results", None)
+        st.session_state.pop("opt_best_params", None)
+        st.session_state.pop("opt_best_objective", None)
+        st.session_state.pop("opt_best_cagr", None)
+        st.session_state.pop("opt_best_max_dd", None)
+        st.rerun()
+else:
+    st.info("Run optimization to see results.")
+
+st.subheader("Walk-forward results")
+wfo_progress_slot = st.empty()
+run_wfo = st.session_state.pop("run_wfo", False)
+if run_wfo:
+    param_values, invalid = build_param_values_from_state(settings)
+    if not invalid:
+        search_mode = st.session_state.get("opt_search_mode", "Grid")
+        max_trials = int(st.session_state.get("opt_max_trials", 200))
+        seed = int(st.session_state.get("opt_seed", 42))
+        wfo_ins_len = int(st.session_state.get("wfo_ins_len", 156))
+        wfo_oos_len = int(st.session_state.get("wfo_oos_len", 52))
+        wfo_mode = st.session_state.get("wfo_mode", "Rolling")
+        shifted_wfo = bool(st.session_state.get("wfo_shifted", False))
+        shift_step_weeks = int(
+            st.session_state.get("wfo_shift_step", max(1, int(wfo_oos_len) // 4))
+        )
+        save_opt_dialog_state()
+
+        warmup_values = {key: settings[key] for key in WARMUP_KEYS}
+        for key, grid in param_values.items():
+            if key in warmup_values:
+                warmup_values[key] = max(grid)
+        warmup_weeks = calc_warmup_weeks(warmup_values)
+        warmup_start = start_date - dt.timedelta(weeks=int(warmup_weeks))
+        raw_opt = raw
+        if raw_opt.empty or raw_opt.index.min() > pd.Timestamp(warmup_start):
+            raw_opt = load_weekly_data(ticker, warmup_start, end_date)
+        if raw_opt.empty:
+            st.error("No data returned for the optimization range.")
+        else:
+            spec_map = OPT_SPEC_MAP
+            data_end_ts = min(pd.Timestamp(end_date), raw_opt.index.max())
+            end_limit = data_end_ts + pd.Timedelta(days=1)
+            oos_len_weeks = int(wfo_oos_len)
+            step_weeks = oos_len_weeks
+            ins_len_weeks = int(wfo_ins_len)
+            shift_step = max(1, min(int(shift_step_weeks), oos_len_weeks))
+            if shifted_wfo:
+                shift_offsets = list(range(0, oos_len_weeks, shift_step))
+            else:
+                shift_offsets = [0]
+
+            total_windows = 0
+            for offset in shift_offsets:
+                oos_cursor = pd.Timestamp(start_date) + pd.Timedelta(weeks=offset)
+                while True:
+                    oos_start = oos_cursor
+                    if oos_start > data_end_ts:
+                        break
+                    oos_end = min(oos_start + pd.Timedelta(weeks=oos_len_weeks), end_limit)
+                    if oos_end <= oos_start:
+                        break
+                    total_windows += 1
+                    oos_cursor = oos_cursor + pd.Timedelta(weeks=step_weeks)
+
+            progress = wfo_progress_slot.progress(0.0) if total_windows > 0 else None
+            wfo_results = []
+            oos_returns_by_shift: dict[int, list[pd.Series]] = {}
+            window_idx = 0
+            for offset in shift_offsets:
+                oos_cursor = pd.Timestamp(start_date) + pd.Timedelta(weeks=offset)
+                initial_ins_start = oos_cursor - pd.Timedelta(weeks=ins_len_weeks)
+                while True:
+                    oos_start = oos_cursor
+                    if oos_start > data_end_ts:
+                        break
+                    if wfo_mode == "Rolling":
+                        ins_start = oos_start - pd.Timedelta(weeks=ins_len_weeks)
+                    else:
+                        ins_start = initial_ins_start
+                    ins_end = oos_start
+                    oos_end = min(oos_start + pd.Timedelta(weeks=oos_len_weeks), end_limit)
+                    if oos_end <= oos_start:
+                        break
+                    combinations = 1
+                    for grid in param_values.values():
+                        combinations *= len(grid)
+                    candidates = []
+                    if search_mode == "Grid" and combinations <= max_trials:
+                        keys = list(param_values.keys())
+                        for combo in itertools.product(*(param_values[key] for key in keys)):
+                            candidates.append(dict(zip(keys, combo)))
+                    else:
+                        rng = random.Random(seed + window_idx)
+                        keys = list(param_values.keys())
+                        for _ in range(int(max_trials)):
+                            candidates.append({key: rng.choice(param_values[key]) for key in keys})
+
+                    best_objective = np.nan
+                    best_cagr = np.nan
+                    best_max_dd = np.nan
+                    best_params = None
+                    for candidate in candidates:
+                        test_settings = settings.copy()
+                        for key, value in candidate.items():
+                            spec = spec_map[key]
+                            test_settings[key] = int(value) if spec["type"] == "int" else float(value)
+                        if test_settings["ma_fast_len"] >= test_settings["ma_slow_len"]:
+                            continue
+                        objective, cagr, max_dd = compute_strategy_objective_window(
+                            raw_opt, test_settings, ins_start, ins_end
+                        )
+                        if np.isnan(objective):
+                            continue
+                        if np.isnan(best_objective) or objective > best_objective:
+                            best_objective = objective
+                            best_cagr = cagr
+                            best_max_dd = max_dd
+                            best_params = test_settings.copy()
+
+                    if not best_params:
+                        break
+
+                    oos_returns = compute_strategy_returns_window(
+                        raw_opt, best_params, oos_start, oos_end, fee=0.003, end_exclusive=True
+                    )
+                    oos_stats = compute_partial_oos_stats(oos_returns)
+                    if not oos_returns.empty:
+                        oos_returns_by_shift.setdefault(int(offset), []).append(oos_returns)
+                    params_display = ", ".join(
+                        f"{key}={best_params[key]}" for key in param_values.keys() if key in best_params
+                    )
+                    wfo_results.append(
+                        {
+                            "Shift (weeks)": int(offset),
+                            "In-sample start": ins_start.date(),
+                            "In-sample end": ins_end.date(),
+                            "OOS start": oos_start.date(),
+                            "OOS end": (oos_end - pd.Timedelta(days=1)).date(),
+                            "IS Objective": best_objective,
+                            "IS CAGR": best_cagr,
+                            "IS Max Drawdown": best_max_dd,
+                            "OOS CAGR": oos_stats.get("CAGR", np.nan),
+                            "OOS Total Return": oos_stats.get("Total Return", np.nan),
+                            "Best params": params_display,
+                        }
+                    )
+                    oos_cursor = oos_cursor + pd.Timedelta(weeks=step_weeks)
+                    window_idx += 1
+                    if progress:
+                        progress.progress(min(window_idx / total_windows, 1.0))
+
+            st.session_state["wfo_results"] = wfo_results
+            oos_shift_stats = []
+            wfo_shift_plot_data: dict[int, dict[str, pd.Series]] = {}
+            for shift_key, series_list in sorted(oos_returns_by_shift.items()):
+                if not series_list:
+                    continue
+                oos_all = pd.concat(series_list).sort_index()
+                if oos_all.empty:
+                    continue
+                equity = 10000.0 * (1 + oos_all).cumprod()
+                price = raw_opt["Close"].reindex(oos_all.index)
+                price, equity = price.align(equity, join="inner")
+                stats = compute_equity_stats(oos_all)
+                if not stats:
+                    partial = compute_partial_oos_stats(oos_all)
+                    stats = {
+                        "Total Return": partial.get("Total Return", np.nan),
+                        "CAGR": partial.get("CAGR", np.nan),
+                        "Max Drawdown": np.nan,
+                        "Sharpe": np.nan,
+                        "Volatility": np.nan,
+                    }
+                oos_shift_stats.append(
+                    {
+                        "Shift (weeks)": shift_key,
+                        "Total Return": stats.get("Total Return", np.nan),
+                        "CAGR": stats.get("CAGR", np.nan),
+                        "Max Drawdown": stats.get("Max Drawdown", np.nan),
+                        "Sharpe (ann.)": stats.get("Sharpe", np.nan),
+                        "Volatility (ann.)": stats.get("Volatility", np.nan),
+                    }
+                )
+                if not price.empty and not equity.empty:
+                    wfo_shift_plot_data[int(shift_key)] = {"price": price, "equity": equity}
+            st.session_state["wfo_oos_shift_stats"] = oos_shift_stats
+            st.session_state["wfo_shift_plot_data"] = wfo_shift_plot_data
+            if progress:
+                progress.empty()
+
+wfo_results = st.session_state.get("wfo_results")
+if wfo_results:
+    wfo_df = pd.DataFrame(wfo_results)
+    wfo_display = wfo_df.copy()
+    if "IS Objective" in wfo_display.columns:
+        wfo_display["IS Objective"] = wfo_display["IS Objective"].apply(format_pct)
+    wfo_display["IS CAGR"] = wfo_display["IS CAGR"].apply(format_pct)
+    if "IS Max Drawdown" in wfo_display.columns:
+        wfo_display["IS Max Drawdown"] = wfo_display["IS Max Drawdown"].apply(format_pct)
+    wfo_display["OOS CAGR"] = wfo_display["OOS CAGR"].apply(format_pct)
+    wfo_display["OOS Total Return"] = wfo_display["OOS Total Return"].apply(format_pct)
+    st.dataframe(wfo_display)
+    oos_shift_stats = st.session_state.get("wfo_oos_shift_stats", [])
+    if oos_shift_stats:
+        st.write("Walk-forward OOS summary by shift")
+        shift_df = pd.DataFrame(oos_shift_stats)
+        shift_display = shift_df.copy()
+        shift_display["Total Return"] = shift_display["Total Return"].apply(format_pct)
+        shift_display["CAGR"] = shift_display["CAGR"].apply(format_pct)
+        shift_display["Max Drawdown"] = shift_display["Max Drawdown"].apply(format_pct)
+        shift_display["Sharpe (ann.)"] = shift_display["Sharpe (ann.)"].apply(format_num)
+        shift_display["Volatility (ann.)"] = shift_display["Volatility (ann.)"].apply(format_pct)
+        st.table(shift_display)
+    wfo_shift_plot_data = st.session_state.get("wfo_shift_plot_data", {})
+    if wfo_shift_plot_data:
+        st.write("Walk-forward price and equity by shift")
+        for shift_key in sorted(wfo_shift_plot_data.keys()):
+            series = wfo_shift_plot_data[shift_key]
+            price = series.get("price", pd.Series(dtype=float))
+            equity = series.get("equity", pd.Series(dtype=float))
+            if price.empty or equity.empty:
+                continue
+            expanded = len(wfo_shift_plot_data) == 1
+            with st.expander(f"Shift {shift_key} weeks", expanded=expanded):
+                fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
+                fig.add_trace(
+                    go.Scatter(x=price.index, y=price, name="Price", line=dict(width=1.2, color="#7a7a7a")),
+                    row=1,
+                    col=1,
+                    secondary_y=False,
+                )
+                fig.add_trace(
+                    go.Scatter(x=equity.index, y=equity, name="Equity (10k)", line=dict(width=1.2, color="#2b8cbe")),
+                    row=1,
+                    col=1,
+                    secondary_y=True,
+                )
+                fig.update_layout(height=320, legend=dict(orientation="h"), yaxis_type="log", yaxis2_type="log")
+                st.plotly_chart(fig, use_container_width=True)
+    if st.button("Clear walk-forward results", key="clear_wfo_results"):
+        st.session_state.pop("wfo_results", None)
+        st.session_state.pop("wfo_oos_shift_stats", None)
+        st.session_state.pop("wfo_shift_plot_data", None)
+        st.rerun()
+else:
+    st.info("Run walk-forward to see results.")
 
 data = compute_regime_indicators(raw, settings)
 regime_labels, regime_rules, valid_mask = classify_downtrend(data, settings)
