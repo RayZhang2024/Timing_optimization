@@ -3,7 +3,6 @@ import itertools
 import json
 import math
 import random
-import re
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +12,21 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 
+from timing_engine import (
+    WARMUP_KEYS,
+    build_param_values,
+    calc_warmup_weeks,
+    compute_equity_stats,
+    compute_partial_oos_stats,
+    compute_regime_summary,
+    compute_signals_window,
+    compute_strategy_objective,
+    compute_strategy_objective_window,
+    compute_strategy_returns_window,
+    compute_trade_returns,
+    prepare_ohlcv_input,
+    parse_priority_order,
+)
 
 st.set_page_config(page_title="Weekly Market Regime Dashboard", layout="wide")
 
@@ -23,446 +37,15 @@ def load_weekly_data(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
         ticker,
         start=start,
         end=end,
+        interval="1wk",
         auto_adjust=False,
         progress=False,
+        group_by="column",
     )
     if data.empty:
         return data
-    data = normalize_ohlcv_columns(data, ticker)
-    if data.empty:
-        return data
-    expected = ["Open", "High", "Low", "Close", "Volume"]
-    missing = [col for col in expected if col not in data.columns]
-    if missing:
-        return pd.DataFrame()
-    data = data[expected]
-    weekly = data.resample("W-FRI").agg(
-        {
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum",
-        }
-    )
-    return weekly.dropna()
-
-
-def normalize_ohlcv_columns(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    if not isinstance(data.columns, pd.MultiIndex):
-        return data
-
-    primary = ticker.replace(",", " ").split()
-    primary = primary[0].upper() if primary else ""
-
-    level0 = data.columns.get_level_values(0)
-    level1 = data.columns.get_level_values(1)
-    if "Open" in level0:
-        tickers = list(dict.fromkeys(level1))
-        pick = primary if primary in tickers else tickers[0]
-        return data.xs(pick, axis=1, level=1)
-
-    tickers = list(dict.fromkeys(level0))
-    pick = primary if primary in tickers else tickers[0]
-    return data[pick]
-
-
-def sma(series: pd.Series, length: int) -> pd.Series:
-    return series.rolling(int(length)).mean()
-
-
-def rsi(series: pd.Series, length: int) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(int(length)).mean()
-    avg_loss = loss.rolling(int(length)).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    return tr.rolling(int(length)).mean()
-
-
-def adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
-    up_move = high.diff()
-    down_move = low.shift(1) - low
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    tr = pd.concat(
-        [
-            high - low,
-            (high - close.shift(1)).abs(),
-            (low - close.shift(1)).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr_val = tr.rolling(int(length)).mean()
-
-    plus_di = 100 * (pd.Series(plus_dm, index=high.index).rolling(int(length)).mean() / atr_val)
-    minus_di = 100 * (pd.Series(minus_dm, index=high.index).rolling(int(length)).mean() / atr_val)
-
-    denom = (plus_di + minus_di).replace(0, np.nan)
-    dx = ((plus_di - minus_di).abs() / denom) * 100
-    return dx.rolling(int(length)).mean()
-
-
-def compute_regime_indicators(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
-    out = df.copy()
-    out["MA_FAST"] = sma(out["Close"], settings["ma_fast_len"])
-    out["MA_SLOW"] = sma(out["Close"], settings["ma_slow_len"])
-    out["RSI"] = rsi(out["Close"], settings["rsi_len"])
-    out["RSI_FAST"] = rsi(out["Close"], settings["rsi_fast_len"])
-    out["ADX"] = adx(out["High"], out["Low"], out["Close"], settings["adx_len"])
-    out["ADX_FAST"] = adx(out["High"], out["Low"], out["Close"], settings["adx_fast_len"])
-    out["ATR"] = atr(out["High"], out["Low"], out["Close"], settings["atr_len"])
-    out["ATR_FAST"] = atr(out["High"], out["Low"], out["Close"], settings["atr_fast_len"])
-    out["ATR_PCT"] = out["ATR"] / out["MA_FAST"] * 100.0
-    out["ATR_PCT_FAST"] = out["ATR_FAST"] / out["MA_FAST"] * 100.0
-    weekly_ret = out["Close"].pct_change()
-    out["VOL"] = weekly_ret.rolling(settings["vol_len"]).std() * np.sqrt(52)
-    out["VOL_FAST"] = weekly_ret.rolling(settings["vol_fast_len"]).std() * np.sqrt(52)
-    out["Volume_MA"] = sma(out["Volume"], settings["volume_ma_len"])
-    out["Volume_MA_FAST"] = sma(out["Volume"], settings["volume_ma_fast_len"])
-    out["Ret_n"] = out["Close"].pct_change(settings["return_window"])
-    return out
-
-
-def classify_downtrend(df: pd.DataFrame, settings: dict) -> tuple[pd.Series, dict[str, pd.Series], pd.Series]:
-    label = pd.Series("none", index=df.index)
-
-    atr_fast_short = df["ATR_PCT_FAST"].rolling(3).max()
-    atr_fast_long = df["ATR_PCT_FAST"].shift(4).rolling(78).max()
-    atr_fast_roll2 = df["ATR_PCT_FAST"].rolling(2).mean()
-    atr_fast_shift2_roll2 = df["ATR_PCT_FAST"].shift(2).rolling(2).mean()
-    atr_fast_shift1_roll5 = df["ATR_PCT_FAST"].shift(1).rolling(5).mean()
-    vol_fast_shift6_roll15 = df["Volume_MA_FAST"].shift(6).rolling(15).max()
-    vol_fast_shift1_roll5 = df["Volume_MA_FAST"].shift(1).rolling(5).max()
-    adx_roll2 = df["ADX"].rolling(2).mean()
-    atr_slow_short = df["ATR_PCT"].rolling(5).mean()
-    atr_slow_long = df["ATR_PCT"].shift(6).rolling(5).mean()
-    vol_slow_shift6 = df["Volume_MA"].shift(6)
-    atr_pct_shift4 = df["ATR_PCT"].shift(4)
-    atr_pct_shift12 = df["ATR_PCT"].shift(12)
-    atr_pct_shift24 = df["ATR_PCT"].shift(24)
-    atr_pct_shift30 = df["ATR_PCT"].shift(30)
-
-    fast_down_trend_raw = (
-        ((df["MA_FAST"] < df["MA_FAST"].shift(1))
-        #& (df["ADX"].rolling(2).mean() > settings["trend_adx_threshold"])
-        & (atr_fast_short > atr_fast_long)
-        & (df["Volume_MA_FAST"] > vol_fast_shift6_roll15)
-        & (df["MA_FAST"] < df["MA_SLOW"]))
-        | ((df["Close"] < df["MA_SLOW"]) & (df["Close"].shift(1) < df["MA_SLOW"])
-        & (df["ATR_PCT_FAST"] > atr_fast_shift1_roll5)
-        & (df["Volume_MA_FAST"] > 1.1 * vol_fast_shift1_roll5)
-        & (adx_roll2 > settings["trend_adx_threshold"])
-        & (df["RSI_FAST"] > 30)
-        )
-    )
-
-    slow_down_trend_raw = (
-        (df["MA_SLOW"] < df["MA_SLOW"].shift(1))
-        & (df["ADX"] > settings["trend_adx_threshold"])
-        & (atr_slow_short > atr_slow_long)
-        & (df["Volume_MA"] > vol_slow_shift6)
-        & (df["ATR_PCT"] > atr_pct_shift4)
-        & (atr_pct_shift4 > atr_pct_shift12)
-        & (atr_pct_shift12 > atr_pct_shift24)
-        & (atr_pct_shift24 > atr_pct_shift30)
-    )
-
-    freeze_uptrend = pd.Series(False, index=df.index)
-    freeze_active = False
-    ma_slow_up = df["MA_SLOW"] > df["MA_SLOW"].shift(1)
-    for idx in df.index:
-        if slow_down_trend_raw.loc[idx]:
-            freeze_active = True
-        if freeze_active and ma_slow_up.loc[idx]:
-            freeze_active = False
-        freeze_uptrend.loc[idx] = freeze_active
-
-    fast_up_trend = (
-        (df["MA_FAST"] > df["MA_FAST"].shift(1))
-        #& (df["ADX_FAST"] > settings["trend_adx_threshold"])
-        & (atr_fast_roll2 < atr_fast_shift2_roll2)
-        & ~freeze_uptrend
-    )
-
-    slow_up_trend = (
-        (df["MA_SLOW"] > df["MA_SLOW"].shift(1))
-        & (df["ADX"] < settings["trend_adx_threshold"])
-        & (atr_slow_short > atr_slow_long)
-        & ~freeze_uptrend
-    )
-
-    panic = (
-        (df["RSI"] < settings["panic_rsi_max"])
-        & (df["Ret_n"] < settings["panic_return_max"])
-        & (df["Volume"] > settings["panic_volume_mult"] * df["Volume_MA"])
-    )
-
-    required_series = [
-        df["MA_FAST"],
-        df["MA_FAST"].shift(1),
-        df["MA_SLOW"],
-        df["MA_SLOW"].shift(1),
-        atr_fast_short,
-        atr_fast_long,
-        atr_fast_roll2,
-        atr_fast_shift2_roll2,
-        atr_fast_shift1_roll5,
-        vol_fast_shift6_roll15,
-        vol_fast_shift1_roll5,
-        adx_roll2,
-        atr_slow_short,
-        atr_slow_long,
-        vol_slow_shift6,
-        atr_pct_shift4,
-        atr_pct_shift12,
-        atr_pct_shift24,
-        atr_pct_shift30,
-        df["ADX"],
-        df["RSI"],
-        df["RSI_FAST"],
-        df["Ret_n"],
-        df["Volume"],
-        df["Volume_MA"],
-    ]
-    valid_mask = pd.concat(required_series, axis=1).notna().all(axis=1)
-
-    freeze_downtrend = pd.Series(False, index=df.index)
-    if settings.get("freeze_down_on_panic", False):
-        freeze_active = False
-        for idx in df.index:
-            if panic.loc[idx]:
-                freeze_active = True
-            if freeze_active and (fast_up_trend.loc[idx] or slow_up_trend.loc[idx]):
-                freeze_active = False
-            freeze_downtrend.loc[idx] = freeze_active
-
-    fast_down_trend = fast_down_trend_raw & ~freeze_downtrend
-    slow_down_trend = slow_down_trend_raw & ~freeze_downtrend
-
-    rules = {
-        "fast_down_trend": fast_down_trend,
-        "slow_down_trend": slow_down_trend,
-        "fast_up_trend": fast_up_trend,
-        "slow_up_trend": slow_up_trend,
-        "panic": panic,
-    }
-    priority_order = settings.get("priority_order") or list(rules.keys())
-    for name in priority_order:
-        condition = rules.get(name)
-        if condition is not None:
-            label.loc[condition] = name
-
-    return label, rules, valid_mask
-
-
-def sharpe_ratio(returns: pd.Series, periods_per_year: int = 52, risk_free: float = 0.0) -> float:
-    clean = returns.dropna()
-    if len(clean) < 2:
-        return np.nan
-    excess = clean - (risk_free / periods_per_year)
-    vol = excess.std()
-    if vol == 0 or np.isnan(vol):
-        return np.nan
-    return np.sqrt(periods_per_year) * excess.mean() / vol
-
-
-def compute_equity_stats(returns: pd.Series) -> dict:
-    clean = returns.dropna()
-    if len(clean) < 2:
-        return {}
-
-    equity = (1 + clean).cumprod()
-    num_weeks = len(equity)
-    total_return = equity.iloc[-1] - 1
-    cagr = (equity.iloc[-1] ** (52 / num_weeks)) - 1
-
-    rolling_max = equity.cummax()
-    drawdown = equity / rolling_max - 1
-    max_dd = drawdown.min()
-    sharpe = sharpe_ratio(clean)
-    volatility = clean.std() * np.sqrt(52)
-
-    return {
-        "Total Return": total_return,
-        "CAGR": cagr,
-        "Max Drawdown": max_dd,
-        "Sharpe": sharpe,
-        "Volatility": volatility,
-        "Returns": clean,
-        "Equity": equity,
-        "Drawdown": drawdown,
-    }
-
-
-def compute_partial_oos_stats(returns: pd.Series) -> dict:
-    clean = returns.dropna()
-    if len(clean) < 1:
-        return {"Total Return": np.nan, "CAGR": np.nan}
-    equity = (1 + clean).cumprod()
-    total_return = equity.iloc[-1] - 1
-    num_weeks = len(equity)
-    cagr = (equity.iloc[-1] ** (52 / num_weeks)) - 1 if num_weeks else np.nan
-    return {"Total Return": total_return, "CAGR": cagr}
-
-
-def compute_trade_returns(
-    returns: pd.Series, buy_signal: pd.Series, sell_signal: pd.Series, fee: float
-) -> tuple[pd.Series, pd.Series]:
-    buy_signal = buy_signal.reindex(returns.index, fill_value=False)
-    sell_signal = sell_signal.reindex(returns.index, fill_value=False)
-    position_raw = pd.Series(np.nan, index=returns.index, dtype=float)
-    position_raw.loc[buy_signal] = 1.0
-    position_raw.loc[sell_signal] = 0.0
-    position_raw = position_raw.ffill().fillna(0.0)
-    position = position_raw.shift(1).fillna(0.0)
-    trade_cost = position.diff().abs()
-    trade_cost.iloc[0] = position.iloc[0]
-    strategy_returns = returns * position - trade_cost * fee
-    return strategy_returns, position
-
-
-def compute_strategy_returns_window(
-    raw: pd.DataFrame,
-    settings: dict,
-    window_start: dt.date,
-    window_end: dt.date,
-    fee: float = 0.003,
-    end_exclusive: bool = False,
-) -> pd.Series:
-    if raw.empty:
-        return pd.Series(dtype=float)
-    data = compute_regime_indicators(raw, settings)
-    _, rules, valid_mask = classify_downtrend(data, settings)
-    valid_index = valid_mask[valid_mask].index
-    if valid_index.empty:
-        return pd.Series(dtype=float)
-    effective_start = max(pd.Timestamp(window_start), valid_index[0])
-    window_end_ts = pd.Timestamp(window_end)
-    if end_exclusive:
-        data = data.loc[(data.index >= effective_start) & (data.index < window_end_ts)].copy()
-    else:
-        data = data.loc[(data.index >= effective_start) & (data.index <= window_end_ts)].copy()
-    if data.empty:
-        return pd.Series(dtype=float)
-    weekly_ret = data["Close"].pct_change()
-    active_regimes = set(settings["priority_order"])
-    buy_signal = pd.Series(False, index=data.index)
-    sell_signal = pd.Series(False, index=data.index)
-    if "fast_up_trend" in active_regimes:
-        buy_signal |= rules["fast_up_trend"].reindex(data.index, fill_value=False)
-    if "slow_up_trend" in active_regimes:
-        buy_signal |= rules["slow_up_trend"].reindex(data.index, fill_value=False)
-    if "panic" in active_regimes:
-        buy_signal |= rules["panic"].reindex(data.index, fill_value=False)
-    if "fast_down_trend" in active_regimes:
-        sell_signal |= rules["fast_down_trend"].reindex(data.index, fill_value=False)
-    if "slow_down_trend" in active_regimes:
-        sell_signal |= rules["slow_down_trend"].reindex(data.index, fill_value=False)
-    strategy_returns, _ = compute_trade_returns(weekly_ret, buy_signal, sell_signal, fee=fee)
-    return strategy_returns
-
-
-def compute_strategy_cagr(
-    raw: pd.DataFrame, settings: dict, start_date: dt.date, fee: float = 0.003
-) -> float:
-    if raw.empty:
-        return np.nan
-    window_end = raw.index.max() + pd.Timedelta(days=1)
-    strategy_returns = compute_strategy_returns_window(
-        raw, settings, start_date, window_end, fee=fee, end_exclusive=True
-    )
-    stats = compute_equity_stats(strategy_returns)
-    return stats.get("CAGR", np.nan)
-
-
-def compute_strategy_cagr_window(
-    raw: pd.DataFrame,
-    settings: dict,
-    window_start: dt.date,
-    window_end: dt.date,
-    fee: float = 0.003,
-    end_exclusive: bool = True,
-) -> float:
-    strategy_returns = compute_strategy_returns_window(
-        raw, settings, window_start, window_end, fee=fee, end_exclusive=end_exclusive
-    )
-    stats = compute_equity_stats(strategy_returns)
-    return stats.get("CAGR", np.nan)
-
-
-def compute_strategy_objective_from_returns(returns: pd.Series) -> tuple[float, float, float]:
-    stats = compute_equity_stats(returns)
-    cagr = stats.get("CAGR", np.nan)
-    max_dd = stats.get("Max Drawdown", np.nan)
-    if np.isnan(cagr) or np.isnan(max_dd):
-        return np.nan, cagr, max_dd
-    objective = cagr + 0.1 * min(max_dd, -0.3)
-    return objective, cagr, max_dd
-
-
-def compute_strategy_objective(
-    raw: pd.DataFrame, settings: dict, start_date: dt.date, fee: float = 0.003
-) -> tuple[float, float, float]:
-    if raw.empty:
-        return np.nan, np.nan, np.nan
-    window_end = raw.index.max() + pd.Timedelta(days=1)
-    strategy_returns = compute_strategy_returns_window(
-        raw, settings, start_date, window_end, fee=fee, end_exclusive=True
-    )
-    return compute_strategy_objective_from_returns(strategy_returns)
-
-
-def compute_strategy_objective_window(
-    raw: pd.DataFrame,
-    settings: dict,
-    window_start: dt.date,
-    window_end: dt.date,
-    fee: float = 0.003,
-    end_exclusive: bool = True,
-) -> tuple[float, float, float]:
-    strategy_returns = compute_strategy_returns_window(
-        raw, settings, window_start, window_end, fee=fee, end_exclusive=end_exclusive
-    )
-    return compute_strategy_objective_from_returns(strategy_returns)
-
-
-def compute_regime_summary(returns: pd.Series, labels: pd.Series, order: list[str]) -> pd.DataFrame:
-    rows = []
-    total_weeks = len(labels)
-    for name in order:
-        mask = labels == name
-        sample = returns[mask]
-        stats = compute_equity_stats(sample)
-        rows.append(
-            {
-                "Regime": name,
-                "Weeks": int(mask.sum()),
-                "Share": (mask.sum() / total_weeks) if total_weeks else np.nan,
-                "Total Return": stats.get("Total Return", np.nan),
-                "CAGR": stats.get("CAGR", np.nan),
-                "Max Drawdown": stats.get("Max Drawdown", np.nan),
-                "Sharpe": stats.get("Sharpe", np.nan),
-                "Volatility": stats.get("Volatility", np.nan),
-            }
-        )
-    return pd.DataFrame(rows)
+    weekly = prepare_ohlcv_input(data, ticker=ticker, resample_rule=None)
+    return weekly
 
 
 def format_pct(value: float) -> str:
@@ -472,37 +55,9 @@ def format_pct(value: float) -> str:
 def format_num(value: float) -> str:
     return "N/A" if np.isnan(value) else f"{value:.2f}"
 
-
-def parse_priority_order(raw: str, options: list[str]) -> list[str]:
-    tokens = [token.strip().lower() for token in re.split(r"[,\s]+", raw) if token.strip()]
-    seen = set()
-    ordered = []
-    for token in tokens:
-        if token in options and token not in seen:
-            ordered.append(token)
-            seen.add(token)
-    return ordered
-
-
 def get_state_or_default(key: str, default):
     return st.session_state.get(key, default)
 
-
-WARMUP_KEYS = [
-    "ma_fast_len",
-    "ma_slow_len",
-    "atr_len",
-    "atr_fast_len",
-    "adx_len",
-    "adx_fast_len",
-    "rsi_len",
-    "rsi_fast_len",
-    "vol_len",
-    "vol_fast_len",
-    "volume_ma_len",
-    "volume_ma_fast_len",
-    "return_window",
-]
 
 OPT_PARAM_SPECS = [
     {"key": "ma_fast_len", "label": "MA fast", "type": "int", "min": 2, "max": 300, "step": 1},
@@ -573,22 +128,6 @@ def restore_opt_dialog_state() -> None:
     for key, value in snapshot.items():
         if key not in st.session_state:
             st.session_state[key] = value
-
-
-def calc_warmup_weeks(values: dict) -> int:
-    base = max(values.get(key, 0) for key in WARMUP_KEYS)
-    return int(base + 120)
-
-
-def build_param_values(min_val: float, max_val: float, step: float, kind: str) -> list:
-    if step <= 0 or max_val < min_val:
-        return []
-    if kind == "int":
-        step_int = max(1, int(step))
-        return list(range(int(min_val), int(max_val) + 1, step_int))
-    count = int(round((max_val - min_val) / step))
-    values = [min_val + i * step for i in range(count + 1)]
-    return [float(f"{val:.6f}") for val in values if min_val - 1e-12 <= val <= max_val + 1e-12]
 
 
 def build_param_values_from_state(settings: dict) -> tuple[dict, bool]:
@@ -908,12 +447,214 @@ with st.sidebar:
     preset_options = ["(select)"] + sorted(presets.keys())
     preset_to_load = st.selectbox("Load preset", options=preset_options, key="preset_to_load")
     load_preset = st.button("Load preset", key="load_preset")
-    optimize_button = st.button("Optimize parameters", key="optimize_button")
-    if optimize_button:
+    current_settings = {
+        "ma_fast_len": ma_fast_len,
+        "ma_slow_len": ma_slow_len,
+        "rsi_len": rsi_len,
+        "rsi_fast_len": rsi_fast_len,
+        "adx_len": adx_len,
+        "adx_fast_len": adx_fast_len,
+        "atr_len": atr_len,
+        "atr_fast_len": atr_fast_len,
+        "vol_len": vol_len,
+        "vol_fast_len": vol_fast_len,
+        "return_window": return_window,
+        "volume_ma_len": volume_ma_len,
+        "volume_ma_fast_len": volume_ma_fast_len,
+        "trend_adx_threshold": trend_adx_threshold,
+        "panic_rsi_max": panic_rsi_max,
+        "panic_return_max": panic_return_max,
+        "panic_volume_mult": panic_volume_mult,
+    }
+    with st.expander("Optimization settings", expanded=False):
         restore_opt_dialog_state()
-        st.session_state["opt_dialog_open"] = True
-        if "opt_prev_range_pct" not in st.session_state:
-            st.session_state["opt_reset_ranges"] = True
+        st.write("Optimize in-sample objective: CAGR + 0.1 * min(Max Drawdown, -0.3).")
+        search_mode = st.selectbox("Search method", ["Grid", "Random"], key="opt_search_mode")
+        if "opt_max_trials" in st.session_state:
+            max_trials = st.number_input(
+                "Max trials", min_value=1, max_value=5000, step=1, key="opt_max_trials"
+            )
+        else:
+            max_trials = st.number_input(
+                "Max trials", min_value=1, max_value=5000, value=200, step=1, key="opt_max_trials"
+            )
+        if "opt_seed" in st.session_state:
+            seed = st.number_input(
+                "Random seed", min_value=0, max_value=100000, step=1, key="opt_seed"
+            )
+        else:
+            seed = st.number_input(
+                "Random seed", min_value=0, max_value=100000, value=42, step=1, key="opt_seed"
+            )
+        if "opt_range_pct" in st.session_state:
+            range_pct = st.number_input(
+                "Range around current (%)",
+                min_value=0.0,
+                max_value=100.0,
+                step=1.0,
+                key="opt_range_pct",
+            )
+        else:
+            range_pct = st.number_input(
+                "Range around current (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=20.0,
+                step=1.0,
+                key="opt_range_pct",
+            )
+
+        prev_range = st.session_state.get("opt_prev_range_pct")
+        if st.session_state.pop("opt_reset_ranges", False) or prev_range is None or not math.isclose(prev_range, range_pct):
+            pct = range_pct / 100.0
+            for spec in OPT_PARAM_SPECS:
+                key = spec["key"]
+                current = st.session_state.get(key, current_settings.get(key))
+                if spec["type"] == "int":
+                    current_val = int(current)
+                    min_val = max(spec["min"], math.floor(current_val * (1 - pct)))
+                    max_val = min(spec["max"], math.ceil(current_val * (1 + pct)))
+                    if min_val > max_val:
+                        min_val = max_val = current_val
+                    st.session_state[f"opt_min_{key}"] = int(min_val)
+                    st.session_state[f"opt_max_{key}"] = int(max_val)
+                    st.session_state[f"opt_step_{key}"] = int(spec["step"])
+                else:
+                    current_val = float(current)
+                    delta = abs(current_val) * pct
+                    min_val = max(spec["min"], current_val - delta)
+                    max_val = min(spec["max"], current_val + delta)
+                    if min_val > max_val:
+                        min_val = max_val = current_val
+                    st.session_state[f"opt_min_{key}"] = float(min_val)
+                    st.session_state[f"opt_max_{key}"] = float(max_val)
+                    st.session_state[f"opt_step_{key}"] = float(spec["step"])
+            st.session_state["opt_prev_range_pct"] = range_pct
+
+        st.markdown("**Tune parameters**")
+        header = st.columns([2.4, 1, 1, 1])
+        header[0].markdown("Parameter")
+        header[1].markdown("Min")
+        header[2].markdown("Max")
+        header[3].markdown("Step")
+
+        for spec in OPT_PARAM_SPECS:
+            key = spec["key"]
+            current = st.session_state.get(key, current_settings.get(key))
+            current_val = int(current) if spec["type"] == "int" else float(current)
+            current_val = min(max(current_val, spec["min"]), spec["max"])
+            row = st.columns([2.4, 1, 1, 1])
+            default_enabled = key not in {"vol_len", "vol_fast_len"}
+            if f"opt_enable_{key}" in st.session_state:
+                row[0].checkbox(spec["label"], key=f"opt_enable_{key}")
+            else:
+                row[0].checkbox(spec["label"], value=default_enabled, key=f"opt_enable_{key}")
+            if f"opt_min_{key}" in st.session_state:
+                row[1].number_input(
+                    "min",
+                    min_value=spec["min"],
+                    max_value=spec["max"],
+                    step=spec["step"],
+                    key=f"opt_min_{key}",
+                    label_visibility="collapsed",
+                )
+            else:
+                row[1].number_input(
+                    "min",
+                    min_value=spec["min"],
+                    max_value=spec["max"],
+                    value=current_val,
+                    step=spec["step"],
+                    key=f"opt_min_{key}",
+                    label_visibility="collapsed",
+                )
+            if f"opt_max_{key}" in st.session_state:
+                row[2].number_input(
+                    "max",
+                    min_value=spec["min"],
+                    max_value=spec["max"],
+                    step=spec["step"],
+                    key=f"opt_max_{key}",
+                    label_visibility="collapsed",
+                )
+            else:
+                row[2].number_input(
+                    "max",
+                    min_value=spec["min"],
+                    max_value=spec["max"],
+                    value=current_val,
+                    step=spec["step"],
+                    key=f"opt_max_{key}",
+                    label_visibility="collapsed",
+                )
+            step_max = max(spec["step"], spec["max"] - spec["min"])
+            if f"opt_step_{key}" in st.session_state:
+                row[3].number_input(
+                    "step",
+                    min_value=spec["step"],
+                    max_value=step_max,
+                    step=spec["step"],
+                    key=f"opt_step_{key}",
+                    label_visibility="collapsed",
+                )
+            else:
+                row[3].number_input(
+                    "step",
+                    min_value=spec["step"],
+                    max_value=step_max,
+                    value=spec["step"],
+                    step=spec["step"],
+                    key=f"opt_step_{key}",
+                    label_visibility="collapsed",
+                )
+
+        st.markdown("**Walk-forward optimization**")
+        if "wfo_ins_len" in st.session_state:
+            st.number_input(
+                "In-sample length (weeks)", min_value=26, max_value=520, step=1, key="wfo_ins_len"
+            )
+        else:
+            st.number_input(
+                "In-sample length (weeks)", min_value=26, max_value=520, value=156, step=1, key="wfo_ins_len"
+            )
+        if "wfo_oos_len" in st.session_state:
+            wfo_oos_len = st.number_input(
+                "Out-of-sample length (weeks)", min_value=13, max_value=260, step=1, key="wfo_oos_len"
+            )
+        else:
+            wfo_oos_len = st.number_input(
+                "Out-of-sample length (weeks)", min_value=13, max_value=260, value=52, step=1, key="wfo_oos_len"
+            )
+        st.caption("Step size equals the out-of-sample length.")
+        st.selectbox("In-sample window", ["Rolling", "Expanding"], key="wfo_mode")
+        if "wfo_shifted" in st.session_state:
+            shifted_wfo = st.checkbox("Shifted walk-forward", key="wfo_shifted")
+        else:
+            shifted_wfo = st.checkbox("Shifted walk-forward", value=False, key="wfo_shifted")
+        shift_default = max(1, int(wfo_oos_len) // 4)
+        if "wfo_shift_step" in st.session_state:
+            st.number_input(
+                "Shift step (weeks)",
+                min_value=1,
+                max_value=int(wfo_oos_len),
+                step=1,
+                key="wfo_shift_step",
+                disabled=not shifted_wfo,
+            )
+        else:
+            st.number_input(
+                "Shift step (weeks)",
+                min_value=1,
+                max_value=int(wfo_oos_len),
+                value=shift_default,
+                step=1,
+                key="wfo_shift_step",
+                disabled=not shifted_wfo,
+            )
+        if shifted_wfo:
+            st.caption("Shifted walk-forward runs multiple offsets within the OOS window length.")
+        save_opt_dialog_state()
+
     run_optimization = st.button("Run optimization", key="run_optimization_sidebar")
     run_wfo = st.button("Run walk-forward", key="run_wfo_sidebar")
     if run_optimization:
@@ -983,132 +724,6 @@ if raw.empty:
 if settings["ma_fast_len"] >= settings["ma_slow_len"]:
     st.warning("MA fast length should be smaller than MA slow length.")
 
-
-@st.dialog("Parameter Optimization")
-def optimization_dialog() -> None:
-    st.write("Optimize in-sample objective: CAGR + 0.1 * min(Max Drawdown, -0.3).")
-    st.caption(f"Date range: {start_date} to {end_date}")
-    search_mode = st.selectbox("Search method", ["Grid", "Random"], key="opt_search_mode")
-    max_trials = st.number_input("Max trials", min_value=1, max_value=5000, value=200, step=1, key="opt_max_trials")
-    seed = st.number_input("Random seed", min_value=0, max_value=100000, value=42, step=1, key="opt_seed")
-    range_pct = st.number_input(
-        "Range around current (%)",
-        min_value=0.0,
-        max_value=100.0,
-        value=20.0,
-        step=1.0,
-        key="opt_range_pct",
-    )
-
-    prev_range = st.session_state.get("opt_prev_range_pct")
-    if st.session_state.pop("opt_reset_ranges", False) or prev_range is None or not math.isclose(prev_range, range_pct):
-        pct = range_pct / 100.0
-        for spec in OPT_PARAM_SPECS:
-            key = spec["key"]
-            current = st.session_state.get(key, settings.get(key))
-            if spec["type"] == "int":
-                current_val = int(current)
-                min_val = max(spec["min"], math.floor(current_val * (1 - pct)))
-                max_val = min(spec["max"], math.ceil(current_val * (1 + pct)))
-                if min_val > max_val:
-                    min_val = max_val = current_val
-                st.session_state[f"opt_min_{key}"] = int(min_val)
-                st.session_state[f"opt_max_{key}"] = int(max_val)
-                st.session_state[f"opt_step_{key}"] = int(spec["step"])
-            else:
-                current_val = float(current)
-                delta = abs(current_val) * pct
-                min_val = max(spec["min"], current_val - delta)
-                max_val = min(spec["max"], current_val + delta)
-                if min_val > max_val:
-                    min_val = max_val = current_val
-                st.session_state[f"opt_min_{key}"] = float(min_val)
-                st.session_state[f"opt_max_{key}"] = float(max_val)
-                st.session_state[f"opt_step_{key}"] = float(spec["step"])
-        st.session_state["opt_prev_range_pct"] = range_pct
-
-    st.markdown("**Tune parameters**")
-    header = st.columns([2.4, 1, 1, 1])
-    header[0].markdown("Parameter")
-    header[1].markdown("Min")
-    header[2].markdown("Max")
-    header[3].markdown("Step")
-
-    for spec in OPT_PARAM_SPECS:
-        key = spec["key"]
-        current = st.session_state.get(key, settings.get(key))
-        if spec["type"] == "int":
-            current_val = int(current)
-        else:
-            current_val = float(current)
-        current_val = min(max(current_val, spec["min"]), spec["max"])
-        row = st.columns([2.4, 1, 1, 1])
-        default_enabled = key not in {"vol_len", "vol_fast_len"}
-        enabled = row[0].checkbox(spec["label"], value=default_enabled, key=f"opt_enable_{key}")
-        min_val = row[1].number_input(
-            "min",
-            min_value=spec["min"],
-            max_value=spec["max"],
-            value=current_val,
-            step=spec["step"],
-            key=f"opt_min_{key}",
-            label_visibility="collapsed",
-        )
-        max_val = row[2].number_input(
-            "max",
-            min_value=spec["min"],
-            max_value=spec["max"],
-            value=current_val,
-            step=spec["step"],
-            key=f"opt_max_{key}",
-            label_visibility="collapsed",
-        )
-        step_max = max(spec["step"], spec["max"] - spec["min"])
-        step_val = row[3].number_input(
-            "step",
-            min_value=spec["step"],
-            max_value=step_max,
-            value=spec["step"],
-            step=spec["step"],
-            key=f"opt_step_{key}",
-            label_visibility="collapsed",
-        )
-    st.caption("Use the sidebar buttons to run optimization and walk-forward.")
-
-    st.markdown("**Walk-forward optimization**")
-    wfo_ins_len = st.number_input(
-        "In-sample length (weeks)", min_value=26, max_value=520, value=156, step=1, key="wfo_ins_len"
-    )
-    wfo_oos_len = st.number_input(
-        "Out-of-sample length (weeks)", min_value=13, max_value=260, value=52, step=1, key="wfo_oos_len"
-    )
-    st.caption("Step size equals the out-of-sample length.")
-    wfo_mode = st.selectbox("In-sample window", ["Rolling", "Expanding"], key="wfo_mode")
-    shifted_wfo = st.checkbox("Shifted walk-forward", value=False, key="wfo_shifted")
-    shift_default = max(1, int(wfo_oos_len) // 4)
-    shift_step_weeks = st.number_input(
-        "Shift step (weeks)",
-        min_value=1,
-        max_value=int(wfo_oos_len),
-        value=shift_default,
-        step=1,
-        key="wfo_shift_step",
-        disabled=not shifted_wfo,
-    )
-    if shifted_wfo:
-        st.caption("Shifted walk-forward runs multiple offsets within the OOS window length.")
-    st.caption("Use the sidebar buttons to run walk-forward and view results in the main window.")
-    save_opt_dialog_state()
-
-    if st.button("Close", key="close_opt_dialog"):
-        save_opt_dialog_state()
-        st.session_state["opt_dialog_open"] = False
-        st.rerun()
-
-
-if st.session_state.get("opt_dialog_open"):
-    restore_opt_dialog_state()
-    optimization_dialog()
 
 st.subheader("Optimization results")
 opt_progress_slot = st.empty()
@@ -1230,7 +845,6 @@ if results:
     )
     if st.button("Apply best parameters", key="apply_best_params"):
         st.session_state["pending_opt_params"] = best_params
-        st.session_state["opt_dialog_open"] = False
         st.rerun()
     if st.button("Clear optimization results", key="clear_opt_results"):
         st.session_state.pop("opt_results", None)
@@ -1393,9 +1007,12 @@ if run_wfo:
                 oos_all = pd.concat(series_list).sort_index()
                 if oos_all.empty:
                     continue
-                equity = 10000.0 * (1 + oos_all).cumprod()
-                price = raw_opt["Close"].reindex(oos_all.index)
-                price, equity = price.align(equity, join="inner")
+                price_full = raw_opt["Close"].loc[oos_all.index.min() : oos_all.index.max()]
+                if price_full.empty:
+                    continue
+                plot_returns = oos_all.reindex(price_full.index).fillna(0.0)
+                equity = 10000.0 * (1 + plot_returns).cumprod()
+                price = price_full
                 stats = compute_equity_stats(oos_all)
                 if not stats:
                     partial = compute_partial_oos_stats(oos_all)
@@ -1480,33 +1097,22 @@ if wfo_results:
 else:
     st.info("Run walk-forward to see results.")
 
-data = compute_regime_indicators(raw, settings)
-regime_labels, regime_rules, valid_mask = classify_downtrend(data, settings)
-data["Regime"] = regime_labels
-valid_index = valid_mask[valid_mask].index
-if valid_index.empty:
+window_end = raw.index.max() + pd.Timedelta(days=1)
+signals = compute_signals_window(raw, settings, start_date, window_end, end_exclusive=True)
+data = signals["data"]
+regime_labels = signals["labels"]
+regime_rules = signals["rules"]
+valid_mask = signals["valid_mask"]
+effective_start = signals["effective_start"]
+if data.empty or effective_start is None:
     st.error("Not enough data to compute indicators with the current settings.")
     st.stop()
-valid_start = valid_index[0]
-effective_start = max(pd.Timestamp(start_date), valid_start)
 if effective_start > pd.Timestamp(start_date):
     st.info(f"Start date adjusted to {effective_start.date()} to allow indicator warm-up.")
-data = data.loc[data.index >= effective_start].copy()
-
-weekly_ret = data["Close"].pct_change()
-active_regimes = set(settings["priority_order"])
-buy_signal = pd.Series(False, index=data.index)
-sell_signal = pd.Series(False, index=data.index)
-if "fast_up_trend" in active_regimes:
-    buy_signal |= regime_rules["fast_up_trend"].reindex(data.index, fill_value=False)
-if "slow_up_trend" in active_regimes:
-    buy_signal |= regime_rules["slow_up_trend"].reindex(data.index, fill_value=False)
-if "panic" in active_regimes:
-    buy_signal |= regime_rules["panic"].reindex(data.index, fill_value=False)
-if "fast_down_trend" in active_regimes:
-    sell_signal |= regime_rules["fast_down_trend"].reindex(data.index, fill_value=False)
-if "slow_down_trend" in active_regimes:
-    sell_signal |= regime_rules["slow_down_trend"].reindex(data.index, fill_value=False)
+data["Regime"] = regime_labels
+weekly_ret = signals["weekly_returns"]
+buy_signal = signals["buy_signal"]
+sell_signal = signals["sell_signal"]
 strategy_returns, _ = compute_trade_returns(weekly_ret, buy_signal, sell_signal, fee=0.003)
 overall = compute_equity_stats(weekly_ret)
 strategy_stats = compute_equity_stats(strategy_returns)
